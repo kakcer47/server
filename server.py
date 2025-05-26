@@ -9,6 +9,7 @@ import hmac
 import hashlib
 from urllib.parse import parse_qs
 import logging
+from pymongo.errors import PyMongoError
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -18,11 +19,11 @@ app = FastAPI()
 
 # Подключение к MongoDB Atlas
 try:
-    client = MongoClient(os.getenv("MONGODB_URI"))
+    client = MongoClient(os.getenv("MONGODB_URI"), serverSelectionTimeoutMS=5000)
     db = client["classifieds"]
     ads_collection = db["ads"]
     profiles_collection = db["profiles"]
-    client.admin.command('ping')  # Проверка подключения
+    client.admin.command('ping')
     logger.info("MongoDB подключён успешно")
 except Exception as e:
     logger.error(f"Ошибка подключения к MongoDB: {e}")
@@ -77,42 +78,52 @@ def validate_init_data(init_data: str) -> dict | None:
 
 @app.post("/api/auth/verify")
 async def verify_auth(auth: AuthRequest):
-    user_data = validate_init_data(auth.initData)
-    if not user_data:
-        raise HTTPException(status_code=401, detail="Invalid Telegram initData")
-    return {"valid": True, "user": user_data}
-
-@app.post("/api/ads")
-async def create_ad(ad: Ad, x_telegram_init_data: str = Header(None)):
-    if not validate_init_data(x_telegram_init_data):
-        raise HTTPException(status_code=401, detail="Invalid Telegram initData")
     try:
-        ad_dict = ad.dict()
-        result = ads_collection.insert_one(ad_dict)
+        user_data = validate_init_data(auth.initData)
+        if not user_data:
+            raise HTTPException(status_code=401, detail="Invalid Telegram initData")
+        return {"valid": True, "user": user_data}
+    except Exception as e:
+        logger.error(f"Ошибка верификации: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка сервера")
+
+@app.post("/api/posts")
+async def create_ad(post: Ad, x_telegram_init_data: str = Header(None)):
+    try:
+        if not validate_init_data(x_telegram_init_data):
+            raise HTTPException(status_code=401, detail="Invalid Telegram initData")
+        post_dict = post.dict()
+        result = ads_collection.insert_one(post_dict)
         logger.info(f"Объявление создано: {result.inserted_id}")
         return {"id": str(result.inserted_id)}
+    except PyMongoError as e:
+        logger.error(f"Ошибка MongoDB при создании объявления: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка базы данных")
     except Exception as e:
         logger.error(f"Ошибка создания объявления: {e}")
         raise HTTPException(status_code=500, detail="Ошибка сервера")
 
-@app.get("/api/ads")
+@app.get("/api/posts")
 async def get_ads(before: str | None = None):
     try:
         query = {"timestamp": {"$lt": before}} if before else {}
-        ads = list(ads_collection.find(query).sort("timestamp", -1).limit(20))
+        ads = list(ads_collection.find(query).sort("timestamp", -1).limit(1))
         for ad in ads:
             ad["_id"] = str(ad["_id"])
-        logger.info(f"Загружено объявлений: {len(ads)}")
+        logger.info(f"Загружено постов: {len(ads)}")
         return ads
+    except PyMongoError as e:
+        logger.error(f"Ошибка MongoDB при загрузке объявлений: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка базы данных")
     except Exception as e:
         logger.error(f"Ошибка загрузки объявлений: {e}")
         raise HTTPException(status_code=500, detail="Ошибка сервера")
 
 @app.post("/api/profile/{user_id}")
 async def update_profile(user_id: str, profile: Profile, x_telegram_init_data: str = Header(None)):
-    if not validate_init_data(x_telegram_init_data):
-        raise HTTPException(status_code=401, detail="Invalid Telegram initData")
     try:
+        if not validate_init_data(x_telegram_init_data):
+            raise HTTPException(status_code=401, detail="Invalid Telegram initData")
         profiles_collection.update_one(
             {"userId": user_id},
             {"$set": {"username": profile.username, "bio": profile.bio}},
@@ -120,6 +131,9 @@ async def update_profile(user_id: str, profile: Profile, x_telegram_init_data: s
         )
         logger.info(f"Профиль обновлён: {user_id}")
         return {"status": "ok"}
+    except PyMongoError as e:
+        logger.error(f"Ошибка MongoDB при обновлении профиля: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка базы данных")
     except Exception as e:
         logger.error(f"Ошибка обновления профиля: {e}")
         raise HTTPException(status_code=500, detail="Ошибка сервера")
@@ -134,21 +148,26 @@ async def get_profile(user_id: str):
         else:
             logger.info(f"Профиль не найден: {user_id}")
         return profile or {"bio": ""}
+    except PyMongoError as e:
+        logger.error(f"Ошибка MongoDB при загрузке профиля: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка базы данных")
     except Exception as e:
         logger.error(f"Ошибка загрузки профиля: {e}")
         raise HTTPException(status_code=500, detail="Ошибка сервера")
 
-@app.get("/api/stream/ads")
+@app.get("/api/stream/posts")
 async def stream_ads():
     async def event_generator():
         try:
-            async with ads_collection.watch() as stream:
+            async with ads_collection.watch(max_await_time_ms=1000) as stream:
                 async for change in stream:
                     if change["operationType"] == "insert":
                         ad = change["fullDocument"]
                         ad["_id"] = str(ad["_id"])
                         logger.info(f"Новое объявление через SSE: {ad['_id']}")
                         yield f"data: {json.dumps(ad)}\n\n"
+        except PyMongoError as e:
+            logger.error(f"Ошибка MongoDB в SSE: {e}")
         except Exception as e:
             logger.error(f"Ошибка SSE: {e}")
     try:
