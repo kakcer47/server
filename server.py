@@ -4,12 +4,12 @@ from pymongo import MongoClient
 from pydantic import BaseModel
 import os
 import json
-from datetime import datetime
+import uvicorn
 
 app = FastAPI()
 
 # Подключение к MongoDB Atlas
-client = MongoClient(os.getenv("MONGODB_URI"))
+client = MongoClient(os.getenv("mongodb+srv://baza:<db_password>@cluster0.otzzusz.mongodb.net/classifieds?retryWrites=true&w=majority&appName=Cluster0"))
 db = client["classifieds"]
 ads_collection = db["ads"]
 profiles_collection = db["profiles"]
@@ -27,13 +27,13 @@ class Profile(BaseModel):
     username: str
     bio: str | None = None
 
-@app.post("/api/ads")
+@app.post("/api")
 async def create_ad(ad: Ad):
     ad_dict = ad.dict()
     result = ads_collection.insert_one(ad_dict)
     return {"id": str(result.inserted_id)}
 
-@app.get("/api/ads")
+@app.get("/api")
 async def get_ads():
     ads = list(ads_collection.find().sort("timestamp", -1).limit(50))
     for ad in ads:
@@ -66,3 +66,7 @@ async def stream_ads():
                     ad["_id"] = str(ad["_id"])
                     yield f"data: {json.dumps(ad)}\n\n"
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
