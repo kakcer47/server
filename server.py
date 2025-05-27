@@ -1,6 +1,5 @@
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import StreamingResponse
-from pymongo import MongoClient
 from pydantic import BaseModel
 import os
 import json
@@ -9,7 +8,9 @@ import hmac
 import hashlib
 from urllib.parse import parse_qs
 import logging
-from pymongo.errors import PyMongoError
+from supabase import create_client, Client
+import asyncio
+from datetime import datetime
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -17,16 +18,15 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Подключение к MongoDB Atlas
+# Подключение к Supabase
 try:
-    client = MongoClient(os.getenv("MONGODB_URI"), serverSelectionTimeoutMS=5000)
-    db = client["classifieds"]
-    ads_collection = db["ads"]
-    profiles_collection = db["profiles"]
-    client.admin.command('ping')
-    logger.info("MongoDB подключён успешно")
+    supabase: Client = create_client(
+        os.getenv("SUPABASE_URL"),
+        os.getenv("SUPABASE_KEY")
+    )
+    logger.info("Supabase подключён успешно")
 except Exception as e:
-    logger.error(f"Ошибка подключения к MongoDB: {e}")
+    logger.error(f"Ошибка подключения к Supabase: {e}")
     raise
 
 # Telegram Bot Token
@@ -38,12 +38,12 @@ class Ad(BaseModel):
     title: str
     description: str
     price: float
-    userId: str
+    user_id: str
     username: str
     timestamp: str
 
 class Profile(BaseModel):
-    userId: str
+    user_id: str
     username: str
     bio: str | None = None
 
@@ -87,89 +87,76 @@ async def verify_auth(auth: AuthRequest):
         logger.error(f"Ошибка верификации: {e}")
         raise HTTPException(status_code=500, detail="Ошибка сервера")
 
-@app.post("/api/posts")
-async def create_ad(post: Ad, x_telegram_init_data: str = Header(None)):
+@app.post("/api/ads")
+async def create_ad(ad: Ad, x_telegram_init_data: str = Header(None)):
     try:
         if not validate_init_data(x_telegram_init_data):
             raise HTTPException(status_code=401, detail="Invalid Telegram initData")
-        post_dict = post.dict()
-        result = ads_collection.insert_one(post_dict)
-        logger.info(f"Объявление создано: {result.inserted_id}")
-        return {"id": str(result.inserted_id)}
-    except PyMongoError as e:
-        logger.error(f"Ошибка MongoDB при создании объявления: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка базы данных")
+        ad_dict = ad.dict()
+        response = supabase.table("ads").insert(ad_dict).execute()
+        if response.data:
+            logger.info(f"Объявление создано: {response.data[0]['id']}")
+            return {"id": response.data[0]["id"]}
+        else:
+            raise HTTPException(status_code=500, detail="Ошибка создания объявления")
     except Exception as e:
         logger.error(f"Ошибка создания объявления: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка сервера")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/posts")
+@app.get("/api/ads")
 async def get_ads(before: str | None = None):
     try:
-        query = {"timestamp": {"$lt": before}} if before else {}
-        ads = list(ads_collection.find(query).sort("timestamp", -1).limit(1))
-        for ad in ads:
-            ad["_id"] = str(ad["_id"])
-        logger.info(f"Загружено постов: {len(ads)}")
-        return ads
-    except PyMongoError as e:
-        logger.error(f"Ошибка MongoDB при загрузке объявлений: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка базы данных")
+        query = supabase.table("ads").select("*").order("timestamp", desc=True).limit(20)
+        if before:
+            query = query.lt("timestamp", before)
+        response = query.execute()
+        logger.info(f"Загружено объявлений: {len(response.data)}")
+        return response.data
     except Exception as e:
         logger.error(f"Ошибка загрузки объявлений: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка сервера")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/profile/{user_id}")
 async def update_profile(user_id: str, profile: Profile, x_telegram_init_data: str = Header(None)):
     try:
         if not validate_init_data(x_telegram_init_data):
             raise HTTPException(status_code=401, detail="Invalid Telegram initData")
-        profiles_collection.update_one(
-            {"userId": user_id},
-            {"$set": {"username": profile.username, "bio": profile.bio}},
-            upsert=True
-        )
+        response = supabase.table("profiles").upsert(
+            {"user_id": user_id, "username": profile.username, "bio": profile.bio}
+        ).execute()
         logger.info(f"Профиль обновлён: {user_id}")
         return {"status": "ok"}
-    except PyMongoError as e:
-        logger.error(f"Ошибка MongoDB при обновлении профиля: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка базы данных")
     except Exception as e:
         logger.error(f"Ошибка обновления профиля: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка сервера")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/profile/{user_id}")
 async def get_profile(user_id: str):
     try:
-        profile = profiles_collection.find_one({"userId": user_id})
-        if profile:
-            profile["_id"] = str(profile["_id"])
-            logger.info(f"Профиль загружен: {user_id}")
-        else:
-            logger.info(f"Профиль не найден: {user_id}")
-        return profile or {"bio": ""}
-    except PyMongoError as e:
-        logger.error(f"Ошибка MongoDB при загрузке профиля: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка базы данных")
+        response = supabase.table("profiles").select("*").eq("user_id", user_id).execute()
+        profile = response.data[0] if response.data else {"bio": ""}
+        logger.info(f"Профиль загружен: {user_id}")
+        return profile
     except Exception as e:
         logger.error(f"Ошибка загрузки профиля: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка сервера")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/stream/posts")
+@app.get("/api/stream/ads")
 async def stream_ads():
     async def event_generator():
-        try:
-            async with ads_collection.watch(max_await_time_ms=1000) as stream:
-                async for change in stream:
-                    if change["operationType"] == "insert":
-                        ad = change["fullDocument"]
-                        ad["_id"] = str(ad["_id"])
-                        logger.info(f"Новое объявление через SSE: {ad['_id']}")
+        last_id = None
+        while True:
+            try:
+                response = supabase.table("ads").select("*").gt("id", last_id or "").order("timestamp", desc=True).execute()
+                for ad in response.data:
+                    if not last_id or ad["id"] > last_id:
+                        logger.info(f"Новое объявление через SSE: {ad['id']}")
                         yield f"data: {json.dumps(ad)}\n\n"
-        except PyMongoError as e:
-            logger.error(f"Ошибка MongoDB в SSE: {e}")
-        except Exception as e:
-            logger.error(f"Ошибка SSE: {e}")
+                        last_id = ad["id"]
+                await asyncio.sleep(5)  # Проверка каждые 5 секунд
+            except Exception as e:
+                logger.error(f"Ошибка SSE: {e}")
+                await asyncio.sleep(5)
     try:
         return StreamingResponse(event_generator(), media_type="text/event-stream")
     except Exception as e:
