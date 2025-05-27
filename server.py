@@ -11,6 +11,7 @@ import logging
 from supabase import create_client, Client
 import asyncio
 from datetime import datetime
+import uuid
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -98,6 +99,8 @@ async def create_ad(ad: Ad, x_telegram_init_data: str = Header(None)):
         if not validate_init_data(x_telegram_init_data):
             raise HTTPException(status_code=401, detail="Invalid Telegram initData")
         ad_dict = ad.dict()
+        # Преобразование user_id в uuid, если это число
+        ad_dict["user_id"] = str(uuid.uuid4()) if not ad_dict["user_id"] else ad_dict["user_id"]
         response = supabase.table("ads").insert(ad_dict).execute()
         if response.data:
             logger.info(f"Объявление создано: {response.data[0]['id']}")
@@ -113,7 +116,7 @@ async def create_ad(ad: Ad, x_telegram_init_data: str = Header(None)):
 async def get_ads(before: str | None = None):
     try:
         query = supabase.table("ads").select("*").order("timestamp", desc=True).limit(20)
-        if before:
+        if before and before != "undefined":
             query = query.lt("timestamp", before)
         response = query.execute()
         logger.info(f"Загружено объявлений: {len(response.data)}")
@@ -127,6 +130,8 @@ async def update_profile(user_id: str, profile: Profile, x_telegram_init_data: s
     try:
         if not validate_init_data(x_telegram_init_data):
             raise HTTPException(status_code=401, detail="Invalid Telegram initData")
+        # Преобразование user_id в uuid, если это число
+        user_id = str(uuid.uuid4()) if not user_id.isalnum() else user_id
         response = supabase.table("profiles").upsert(
             {"user_id": user_id, "username": profile.username, "bio": profile.bio}
         ).execute()
@@ -139,6 +144,8 @@ async def update_profile(user_id: str, profile: Profile, x_telegram_init_data: s
 @app.get("/api/profile/{user_id}")
 async def get_profile(user_id: str):
     try:
+        # Преобразование user_id в uuid, если это число
+        user_id = str(uuid.uuid4()) if not user_id.isalnum() else user_id
         response = supabase.table("profiles").select("*").eq("user_id", user_id).execute()
         profile = response.data[0] if response.data else {"bio": ""}
         logger.info(f"Профиль загружен: {user_id}")
@@ -153,7 +160,10 @@ async def stream_ads():
         last_id = None
         while True:
             try:
-                response = supabase.table("ads").select("*").gt("id", last_id or "").order("timestamp", desc=True).execute()
+                query = supabase.table("ads").select("*").order("timestamp", desc=True)
+                if last_id:
+                    query = query.gt("id", last_id)
+                response = query.execute()
                 for ad in response.data:
                     if not last_id or ad["id"] > last_id:
                         logger.info(f"Новое объявление через SSE: {ad['id']}")
@@ -170,5 +180,5 @@ async def stream_ads():
         raise HTTPException(status_code=500, detail="Ошибка сервера")
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", 10000))  # Убедитесь, что порт совпадает с Render
     uvicorn.run(app, host="0.0.0.0", port=port)
