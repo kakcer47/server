@@ -55,17 +55,21 @@ def validate_init_data(init_data: str) -> dict | None:
         logger.warning("TELEGRAM_BOT_TOKEN или initData отсутствуют")
         return None
     try:
+        logger.info(f"Получен initData: {init_data}")
         parsed_data = parse_qs(init_data)
+        logger.info(f"Распарсенный initData: {parsed_data}")
         hash_value = parsed_data.get("hash", [""])[0]
         data_check = "\n".join(
             f"{k}={v[0]}" for k, v in sorted(parsed_data.items()) if k != "hash"
         )
+        logger.info(f"data_check: {data_check}")
         secret_key = hmac.new(
             b"WebAppData", TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256
         ).digest()
         computed_hash = hmac.new(
             secret_key, data_check.encode(), hashlib.sha256
         ).hexdigest()
+        logger.info(f"Вычисленный хэш: {computed_hash}, ожидаемый: {hash_value}")
         if not hmac.compare_digest(computed_hash, hash_value):
             logger.error("Недействительный хэш initData")
             return None
@@ -90,6 +94,7 @@ async def verify_auth(auth: AuthRequest):
 @app.post("/api/ads")
 async def create_ad(ad: Ad, x_telegram_init_data: str = Header(None)):
     try:
+        logger.info(f"Запрос на создание объявления: {ad.dict()}")
         if not validate_init_data(x_telegram_init_data):
             raise HTTPException(status_code=401, detail="Invalid Telegram initData")
         ad_dict = ad.dict()
@@ -98,6 +103,7 @@ async def create_ad(ad: Ad, x_telegram_init_data: str = Header(None)):
             logger.info(f"Объявление создано: {response.data[0]['id']}")
             return {"id": response.data[0]["id"]}
         else:
+            logger.error("Supabase не вернул данные после вставки")
             raise HTTPException(status_code=500, detail="Ошибка создания объявления")
     except Exception as e:
         logger.error(f"Ошибка создания объявления: {e}")
