@@ -1,12 +1,22 @@
 {
-  "name": "ads-blockchain-server",
+  "name": "fractal-ads-platform",
   "version": "1.0.0",
-  "description": "WebSocket server for Decentralized Ads Platform",
+  "description": "Decentralized ad platform with Fractal Mesh Network",
   "main": "server.js",
+  "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "echo 'Installing dependencies for Render' && npm install --ignore-scripts && echo 'Building native modules if needed'"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
   },
   "dependencies": {
-    "ws": "^8.14.2"
-  }
+    "ws": "^8.17.1",
+    "wrtc": "^0.4.7"
+  },
+  "devDependencies": {},
+  "author": "Your Name",
+  "license": "MIT"
 }
