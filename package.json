@@ -5,17 +5,15 @@
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "postinstall": "echo 'Installing dependencies for Render'"
+    "start": "node server.js"
   },
   "engines": {
     "node": ">=18.0.0",
     "npm": ">=8.0.0"
   },
   "dependencies": {
-    "ws": "^8.17.1"
+    "ws": "^8.18.2"
   },
-  "devDependencies": {},
   "author": "Your Name",
   "license": "MIT"
 }
