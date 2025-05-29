@@ -1,20 +1,19 @@
 {
   "name": "fractal-ads-platform",
   "version": "1.0.0",
-  "description": "Decentralized ad platform with Fractal Mesh Network",
+  "description": "Decentralized ad platform with Fractal Mesh Network (Signaling Server)",
   "main": "server.js",
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "postinstall": "echo 'Installing dependencies for Render' && npm install --ignore-scripts && echo 'Building native modules if needed'"
+    "postinstall": "echo 'Installing dependencies for Render'"
   },
   "engines": {
     "node": ">=18.0.0",
     "npm": ">=8.0.0"
   },
   "dependencies": {
-    "ws": "^8.17.1",
-    "wrtc": "^0.4.7"
+    "ws": "^8.17.1"
   },
   "devDependencies": {},
   "author": "Your Name",
