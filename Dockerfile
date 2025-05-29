@@ -7,10 +7,14 @@ RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     libvpx-dev \
-    && npm install -g node-pre-gyp
+    libopus-dev \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g node-pre-gyp node-gyp
 
 COPY package*.json ./
-RUN npm install --build-from-source
+RUN npm install --build-from-source --verbose
 
 COPY . .
 
