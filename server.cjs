@@ -1,18 +1,22 @@
 const WebSocket = require('ws');
+   const http = require('http');
+   const server = http.createServer();
+   const wss = new WebSocket.Server({ server });
 
-const wss = new WebSocket.Server({ port: 8080 });
+   wss.on('connection', (ws) => {
+     console.log('New client connected');
+     ws.on('message', (message) => {
+       const msg = JSON.parse(message);
+       wss.clients.forEach((client) => {
+         if (client !== ws && client.readyState === WebSocket.OPEN) {
+           client.send(JSON.stringify({ ...msg, from: msg.from || 'unknown' }));
+         }
+       });
+     });
+     ws.on('close', () => console.log('Client disconnected'));
+   });
 
-wss.on('connection', (ws) => {
-  console.log('New client connected');
-  ws.on('message', (message) => {
-    const msg = JSON.parse(message);
-    wss.clients.forEach((client) => {
-      if (client !== ws && client.readyState === WebSocket.OPEN) {
-        client.send(JSON.stringify({ ...msg, from: msg.from || 'unknown' }));
-      }
-    });
-  });
-  ws.on('close', () => console.log('Client disconnected'));
-});
-
-console.log('WebSocket server running on ws://localhost:8080');
+   const PORT = process.env.PORT || 8080;
+   server.listen(PORT, () => {
+     console.log(`WebSocket server running on port ${PORT}`);
+   });
