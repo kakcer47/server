@@ -14,6 +14,7 @@ wss.on('connection', (ws) => {
     const msg = JSON.parse(message.toString());
     console.log(`Received: ${msg.type} from ${clientId}`);
 
+    // Пересылаем сообщение всем остальным клиентам
     for (const [id, client] of clients) {
       if (id !== clientId && client.readyState === WebSocket.OPEN) {
         client.send(message);
