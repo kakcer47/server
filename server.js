@@ -1,7 +1,7 @@
-import WebSocket from 'ws';
+import { WebSocketServer } from 'ws';
 
 const port = process.env.PORT || 8080;
-const wss = new WebSocket.Server({ port });
+const wss = new WebSocketServer({ port });
 
 const clients = new Map();
 
@@ -16,7 +16,7 @@ wss.on('connection', (ws) => {
 
     // Пересылаем сообщение всем остальным клиентам
     for (const [id, client] of clients) {
-      if (id !== clientId && client.readyState === WebSocket.OPEN) {
+      if (id !== clientId && client.readyState === 1) { // 1 = OPEN
         client.send(message);
       }
     }
