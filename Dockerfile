@@ -2,19 +2,23 @@ FROM node:18
 
 WORKDIR /app
 
-# Copy package.json and install dependencies
-COPY package*.json ./
+# Установи системные зависимости для компиляции wrtc
 RUN apt-get update && apt-get install -y \
     build-essential \
     python3 \
+    python3-pip \
     libvpx-dev \
-    && npm install --build-from-source
+    && npm install -g node-pre-gyp
 
-# Copy the rest of the application
+# Копируй package.json и установи зависимости
+COPY package*.json ./
+RUN npm install --build-from-source
+
+# Копируй остальной код
 COPY . .
 
-# Expose the port Render will provide
+# Укажи порт, который предоставит Render
 EXPOSE $PORT
 
-# Start the server
+# Запусти сервер
 CMD ["npm", "start"]
