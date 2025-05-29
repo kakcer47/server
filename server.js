@@ -1,47 +1,30 @@
 import WebSocket from 'ws';
-import { RTCPeerConnection, RTCSessionDescription, RTCIceCandidate } from 'wrtc';
 
 const port = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port });
 
+const clients = new Map();
+
 wss.on('connection', (ws) => {
-  console.log('Client connected');
-  let peerConnection;
+  const clientId = Math.random().toString(36).substr(2, 9);
+  clients.set(clientId, ws);
+  console.log(`Client ${clientId} connected`);
 
-  ws.on('message', async (message) => {
+  ws.on('message', (message) => {
     const msg = JSON.parse(message.toString());
+    console.log(`Received: ${msg.type} from ${clientId}`);
 
-    if (msg.type === 'offer') {
-      peerConnection = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-      });
-
-      await peerConnection.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-      const answer = await peerConnection.createAnswer();
-      await peerConnection.setLocalDescription(answer);
-
-      ws.send(JSON.stringify({ type: 'answer', sdp: peerConnection.localDescription }));
-
-      peerConnection.onicecandidate = (event) => {
-        if (event.candidate) {
-          ws.send(JSON.stringify({ type: 'ice', candidate: event.candidate }));
-        }
-      };
-
-      peerConnection.ondatachannel = (event) => {
-        const dataChannel = event.channel;
-        dataChannel.onmessage = (event) => {
-          console.log('Received ad data:', event.data);
-          dataChannel.send('Ad received: ' + event.data);
-        };
-        dataChannel.onopen = () => console.log('DataChannel opened');
-        dataChannel.onclose = () => console.log('DataChannel closed');
-      };
-    } else if (msg.type === 'ice') {
-      if (peerConnection) {
-        await peerConnection.addIceCandidate(new RTCIceCandidate(msg.candidate));
+    // Пересылаем сообщение всем остальным клиентам
+    for (const [id, client] of clients) {
+      if (id !== clientId && client.readyState === WebSocket.OPEN) {
+        client.send(message);
       }
     }
+  });
+
+  ws.on('close', () => {
+    clients.delete(clientId);
+    console.log(`Client ${clientId} disconnected`);
   });
 });
 
