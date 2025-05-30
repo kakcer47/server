@@ -1,19 +1,11 @@
 {
-       "name": "fractal-ads-platform",
-       "version": "1.0.0",
-       "description": "Decentralized ad platform with Fractal Mesh Network (Signaling Server)",
-       "main": "server.js",
-       "type": "module",
-       "scripts": {
-         "start": "node server.cjs"
-       },
-       "engines": {
-         "node": ">=18.0.0",
-         "npm": ">=8.0.0"
-       },
-       "dependencies": {
-         "ws": "^8.17.1"
-       },
-       "author": "Your Name",
-       "license": "MIT"
-     }
+  "name": "signal-server",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.14.2"
+  }
+}
