@@ -1,36 +1,32 @@
-from fastapi import FastAPI, Request
-from pydantic import BaseModel
-import httpx
-import os
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Request
+from pydantic import BaseModel
+import requests
 
-@app.post("/send")
-async def send_message(request: Request):
-    data = await request.json()
-    print("👉 Получены данные:", data)
+app = FastAPI()  # ✅ вот здесь создаём объект приложения
 
-app = FastAPI()
-
+# Разрешаем CORS с Vercel-домена
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://ssw-livid.vercel.app"],  # или ["https://yourapp.vercel.app"]
+    allow_origins=["https://ssw-livid.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-BOT_TOKEN = "7948285859:AAGPM2BYYE2US3AIbP7P4yEBV4C5oWt3FSw"
-CHAT_ID = "-1002361596586"
-
-class MessageInput(BaseModel):
+# Модель запроса
+class Message(BaseModel):
     username: str
     message: str
 
+# Роут отправки
 @app.post("/send")
-async def send_message(data: MessageInput):
-    text = f"📩 Сообщение от {data.username}:\n\n{data.message}"
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    async with httpx.AsyncClient() as client:
-        await client.post(url, data={"chat_id": CHAT_ID, "text": text})
-    return {"status": "ok"}
+def send_message(msg: Message):
+    text = f"✉️ Новое сообщение от {msg.username}:\n{msg.message}"
+    url = "https://api.telegram.org/bot7948285859:AAGPM2BYYE2US3AIbP7P4yEBV4C5oWt3FSw/sendMessage"
+    payload = {
+        "chat_id": "-1002361596586",
+        "text": text
+    }
+    r = requests.post(url, data=payload)
+    return {"ok": True, "status": r.status_code}
