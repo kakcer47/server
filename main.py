@@ -3,6 +3,12 @@ from pydantic import BaseModel
 import httpx
 import os
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Request
+
+@app.post("/send")
+async def send_message(request: Request):
+    data = await request.json()
+    print("👉 Получены данные:", data)
 
 app = FastAPI()
 
