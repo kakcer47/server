@@ -2,8 +2,17 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel
 import httpx
 import os
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # или ["https://yourapp.vercel.app"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 BOT_TOKEN = "7948285859:AAGPM2BYYE2US3AIbP7P4yEBV4C5oWt3FSw"
 CHAT_ID = "-1002361596586"
