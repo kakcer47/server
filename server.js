@@ -3,13 +3,14 @@ const multer = require('multer');
 const fetch = require('node-fetch');
 const compression = require('compression');
 const cors = require('cors');
+const FormData = require('form-data');
 const app = express();
 const port = process.env.PORT || 3000;
 
 // Оптимизация: минимизация задержек
-app.use(compression()); // Сжатие ответов
-app.use(cors()); // Разрешить CORS для фронтенда
-app.use(express.json({ limit: '5mb' })); // Ограничение размера тела запроса
+app.use(compression());
+app.use(cors());
+app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // Настройка multer для обработки файлов
@@ -24,28 +25,38 @@ app.post('/upload', upload.single('image'), async (req, res) => {
         let textUrl = '';
         let imageUrl = '';
 
-        // Обработка текста (отправка в JSON Blob)
-    if (req.body.text) {
-        const textResponse = await fetch('https://jsonblob.com/api/jsonBlob', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: req.body.text })
+        // Логирование входящего запроса
+        console.log('Received request:', {
+            hasText: !!req.body.text,
+            hasImage: !!req.file
         });
 
-        // Извлечение ID из заголовка Location
-        if (textResponse.ok) {
-            const locationHeader = textResponse.headers.get('Location');
-            if (locationHeader) {
-                // Формируем URL для доступа к JSON Blob
-                const blobId = locationHeader.split('/').pop();
-                textUrl = `https://jsonblob.com/api/jsonBlob/${blobId}`;
+        // Обработка текста (отправка в JSON Blob)
+        if (req.body.text) {
+            const textResponse = await fetch('https://jsonblob.com/api/jsonBlob', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content: req.body.text })
+            });
+
+            const textBody = await textResponse.text();
+            console.log('JSON Blob response:', {
+                status: textResponse.status,
+                body: textBody
+            });
+
+            if (textResponse.ok) {
+                const locationHeader = textResponse.headers.get('Location');
+                if (locationHeader) {
+                    const blobId = locationHeader.split('/').pop();
+                    textUrl = `https://jsonblob.com/api/jsonBlob/${blobId}`;
+                } else {
+                    throw new Error('No Location header in JSON Blob response');
+                }
             } else {
-                throw new Error('No Location header in JSON Blob response');
+                throw new Error(`JSON Blob failed: ${textBody}`);
             }
-        } else {
-            throw new Error('Failed to upload text to JSON Blob');
         }
-    }
 
         // Обработка изображения (отправка в Postimg.cc)
         if (req.file) {
@@ -56,21 +67,39 @@ app.post('/upload', upload.single('image'), async (req, res) => {
                 method: 'POST',
                 body: formData
             });
-            const imageResult = await imageResponse.json();
+
+            const imageBody = await imageResponse.text();
+            console.log('Postimg.cc response:', {
+                status: imageResponse.status,
+                body: imageBody
+            });
+
+            let imageResult;
+            try {
+                imageResult = JSON.parse(imageBody);
+            } catch (parseError) {
+                throw new Error(`Invalid JSON from Postimg.cc: ${imageBody}`);
+            }
 
             if (imageResult.success) {
                 imageUrl = imageResult.url;
             } else {
-                throw new Error('Failed to upload image to Postimg.cc');
+                throw new Error(`Postimg.cc upload failed: ${imageBody}`);
             }
         }
 
+        // Логирование успешного ответа
+        console.log('Sending response:', { textUrl, imageUrl });
+
+        res.setHeader('Content-Type', 'application/json');
         res.json({
             success: true,
             textUrl: textUrl,
             imageUrl: imageUrl
         });
     } catch (error) {
+        // Логирование ошибки
+        console.error('Error in /upload:', error.message);
         res.status(500).json({
             success: false,
             error: error.message
