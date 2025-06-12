@@ -51,23 +51,24 @@ async fn handle_socket(ws: WebSocket, state: AppState) {
     let client_id = Uuid::new_v4().to_string();
 
     state.clients.lock().await.insert(client_id.clone(), tx);
-    let clients = state.clients.clone();
 
-    // Отправка клиенту
+    let clients = state.clients.clone();
+    let client_id_for_spawn = client_id.clone();   // Клонируем для использования в spawned task
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if ws_tx.send(msg).await.is_err() {
                 break;
             }
         }
-        clients.lock().await.remove(&client_id);
+        clients.lock().await.remove(&client_id_for_spawn);
     });
 
     // Приём от клиента
     while let Some(Ok(msg)) = ws_rx.next().await {
         if msg.is_text() {
             if let Ok(value) = serde_json::from_str::<Value>(msg.to_str().unwrap()) {
-                handle_message(value, &client_id, &state).await;
+                let client_id_for_handle = client_id.clone(); // клонируем
+                handle_message(value, &client_id_for_handle, &state).await;
             }
         }
     }
