@@ -1,188 +1,128 @@
-use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+// ✅ Полноценный продакшн WebSocket сервер с Supabase интеграцией
+
+use warp::Filter;
+use warp::ws::{Message, WebSocket};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use warp::Filter;
-use warp::ws::Message;
+use futures_util::{SinkExt, StreamExt};
+use serde_json::Value;
+use uuid::Uuid;
+use reqwest::Client;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-enum ClientMessage {
-    Init { user_id: String, username: String },
-    Subscribe { topic: String },
-    Unsubscribe { topic: String },
-    Publish { topic: String, message: String },
-    Like { post_id: String },
-    Filter { topics: Vec<String> },
-    Search { query: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Post {
-    post_id: String,
-    topic: String,
-    message: String,
-    author: Author,
-    timestamp: String,
-    likes: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Author {
-    id: String,
-    username: String,
-}
-
+// ========== Типы ==========
 type Clients = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Message>>>>;
-type Topics = Arc<Mutex<HashMap<String, VecDeque<Post>>>>;
-type Likes = Arc<Mutex<HashMap<String, HashSet<String>>>>;
-type Subscriptions = Arc<Mutex<HashMap<String, HashSet<String>>>>;
-type Authors = Arc<Mutex<HashMap<String, Author>>>;
 
+#[derive(Clone)]
+struct AppState {
+    clients: Clients,
+    http: Client,
+    supabase_url: String,
+    supabase_key: String,
+}
+
+// ========== Точка входа ==========
 #[tokio::main]
 async fn main() {
-    let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
-    let topics: Topics = Arc::new(Mutex::new(HashMap::new()));
-    let likes: Likes = Arc::new(Mutex::new(HashMap::new()));
-    let subs: Subscriptions = Arc::new(Mutex::new(HashMap::new()));
-    let authors: Authors = Arc::new(Mutex::new(HashMap::new()));
+    let state = AppState {
+        clients: Arc::new(Mutex::new(HashMap::new())),
+        http: Client::new(),
+        supabase_url: std::env::var("SUPABASE_URL").expect("SUPABASE_URL not set"),
+        supabase_key: std::env::var("SUPABASE_KEY").expect("SUPABASE_KEY not set"),
+    };
 
     let ws_route = warp::path("ws")
         .and(warp::ws())
-        .and(with_state(clients.clone()))
-        .and(with_state(topics.clone()))
-        .and(with_state(likes.clone()))
-        .and(with_state(subs.clone()))
-        .and(with_state(authors.clone()))
-        .map(|ws: warp::ws::Ws, clients, topics, likes, subs, authors| {
-            ws.on_upgrade(move |socket| {
-                handle_connection(socket, clients, topics, likes, subs, authors)
-            })
-        });
+        .and(with_state(state.clone()))
+        .map(|ws: warp::ws::Ws, state| ws.on_upgrade(move |socket| handle_socket(socket, state)));
 
-    println!("Server running on ws://0.0.0.0:8080");
+    println!("🚀 WebSocket server running on ws://0.0.0.0:8080");
     warp::serve(ws_route).run(([0, 0, 0, 0], 8080)).await;
 }
 
-fn with_state<T: Clone + Send + Sync + 'static>(state: T) -> impl Filter<Extract = (T,), Error = std::convert::Infallible> + Clone {
+fn with_state(state: AppState) -> impl Filter<Extract = (AppState,), Error = std::convert::Infallible> + Clone {
     warp::any().map(move || state.clone())
 }
 
-async fn handle_connection(
-    ws: warp::ws::WebSocket,
-    clients: Clients,
-    topics: Topics,
-    likes: Likes,
-    subs: Subscriptions,
-    authors: Authors,
-) {
+// ========== Обработка соединения ==========
+async fn handle_socket(ws: WebSocket, state: AppState) {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client_id = uuid::Uuid::new_v4().to_string();
+    let client_id = Uuid::new_v4().to_string();
 
-    clients.lock().await.insert(client_id.clone(), tx.clone());
+    state.clients.lock().await.insert(client_id.clone(), tx);
+    let clients = state.clients.clone();
 
+    // Отправка клиенту
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if ws_tx.send(msg).await.is_err() {
                 break;
             }
         }
+        clients.lock().await.remove(&client_id);
     });
 
+    // Приём от клиента
     while let Some(Ok(msg)) = ws_rx.next().await {
-        if let Ok(text) = msg.to_str() {
-            if let Ok(parsed) = serde_json::from_str::<ClientMessage>(text) {
-                handle_message(
-                    parsed,
-                    &client_id,
-                    &clients,
-                    &topics,
-                    &likes,
-                    &subs,
-                    &authors,
-                )
-                .await;
+        if msg.is_text() {
+            if let Ok(value) = serde_json::from_str::<Value>(msg.to_str().unwrap()) {
+                handle_message(value, &client_id, &state).await;
             }
         }
     }
-
-    clients.lock().await.remove(&client_id);
-    subs.lock().await.remove(&client_id);
 }
 
-async fn handle_message(
-    msg: ClientMessage,
-    client_id: &str,
-    clients: &Clients,
-    topics: &Topics,
-    likes: &Likes,
-    subs: &Subscriptions,
-    authors: &Authors,
-) {
-    match msg {
-        ClientMessage::Init { user_id, username } => {
-            authors.lock().await.insert(client_id.to_string(), Author { id: user_id, username });
-        }
-        ClientMessage::Subscribe { topic } => {
-            subs.lock().await.entry(client_id.to_string()).or_default().insert(topic.clone());
-            let messages = topics.lock().await.get(&topic).cloned().unwrap_or_default();
-            if let Some(tx) = clients.lock().await.get(client_id) {
-                for post in messages.iter().rev().take(25).rev() {
-                    let msg = Message::text(serde_json::to_string(post).unwrap());
-                    let _ = tx.send(msg);
-                }
+// ========== Обработка сообщений ==========
+async fn handle_message(msg: Value, client_id: &str, state: &AppState) {
+    match msg.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        "Publish" => {
+            if let Some(entry) = msg.get("entry") {
+                let _ = save_entry_to_supabase(entry.clone(), state).await;
+                broadcast_to_others(client_id, entry.clone(), state).await;
             }
         }
-        ClientMessage::Unsubscribe { topic } => {
-            subs.lock().await.entry(client_id.to_string()).or_default().remove(&topic);
+        "Like" => {
+            if let (Some(entry_id), Some(telegram_id)) = (msg.get("entry_id"), msg.get("telegram_id")) {
+                let _ = toggle_like(entry_id.as_i64().unwrap(), telegram_id.as_i64().unwrap(), state).await;
+                // можно также разослать лайк
+            }
         }
-        ClientMessage::Publish { topic, message } => {
-            let post_id = uuid::Uuid::new_v4().to_string();
-            let timestamp = chrono::Utc::now().to_rfc3339();
-            let author = authors.lock().await.get(client_id).cloned().unwrap_or(Author { id: "anon".into(), username: "anon".into() });
-            let post = Post { post_id: post_id.clone(), topic: topic.clone(), message, author, timestamp, likes: 0 };
+        _ => {}
+    }
+}
 
-            let mut topics_lock = topics.lock().await;
-            let queue = topics_lock.entry(topic.clone()).or_default();
-            queue.push_back(post.clone());
-            if queue.len() > 100 { queue.pop_front(); }
+// ========== Сохранение поста ==========
+async fn save_entry_to_supabase(entry: Value, state: &AppState) -> Result<(), reqwest::Error> {
+    state.http
+        .post(format!("{}/rest/v1/entries", state.supabase_url))
+        .bearer_auth(&state.supabase_key)
+        .json(&entry)
+        .send()
+        .await?;
+    Ok(())
+}
 
-            let post_json = Message::text(serde_json::to_string(&post).unwrap());
-            let subs_map = subs.lock().await;
-            let clients_map = clients.lock().await;
-            for (id, topics) in subs_map.iter() {
-                if topics.contains(&topic) && id != client_id {
-                    if let Some(tx) = clients_map.get(id) {
-                        let _ = tx.send(post_json.clone());
-                    }
-                }
-            }
-        }
-        ClientMessage::Like { post_id } => {
-            let mut likes_map = likes.lock().await;
-            let entry = likes_map.entry(post_id.clone()).or_default();
-            entry.insert(client_id.to_string());
-        }
-        ClientMessage::Filter { topics: filter_topics } => {
-            subs.lock().await.insert(client_id.to_string(), filter_topics.iter().cloned().collect());
-        }
-        ClientMessage::Search { query } => {
-            let topics_lock = topics.lock().await;
-            let mut results = Vec::new();
-            for messages in topics_lock.values() {
-                for post in messages.iter() {
-                    if post.message.contains(&query) {
-                        results.push(post.clone());
-                    }
-                }
-            }
-            if let Some(tx) = clients.lock().await.get(client_id) {
-                for post in results.iter().take(25) {
-                    let _ = tx.send(Message::text(serde_json::to_string(post).unwrap()));
-                }
-            }
+// ========== Переключение лайка ==========
+async fn toggle_like(entry_id: i64, telegram_id: i64, state: &AppState) -> Result<(), reqwest::Error> {
+    state.http
+        .post(format!("{}/rest/v1/rpc/toggle_like", state.supabase_url))
+        .bearer_auth(&state.supabase_key)
+        .json(&serde_json::json!({ "entry_id": entry_id, "user_telegram_id": telegram_id }))
+        .send()
+        .await?;
+    Ok(())
+}
+
+// ========== Рассылка ==========
+async fn broadcast_to_others(sender_id: &str, entry: Value, state: &AppState) {
+    let msg = Message::text(
+        serde_json::json!({ "type": "NewPost", "entry": entry }).to_string(),
+    );
+
+    for (id, tx) in state.clients.lock().await.iter() {
+        if id != sender_id {
+            let _ = tx.send(msg.clone());
         }
     }
 }
