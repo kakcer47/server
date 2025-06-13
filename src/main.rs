@@ -118,7 +118,6 @@ async fn main() {
 
     let routes = ws_route.or(health).with(cors);
 
-    // Render требует читать PORT из env
     let port = std::env::var("PORT")
         .unwrap_or_else(|_| "8080".to_string())
         .parse::<u16>()
@@ -129,9 +128,6 @@ async fn main() {
     warp::serve(routes)
         .bind(([0, 0, 0, 0], port))
         .await;
-    
-    println!("✅ Server started successfully!");
-}
 }
 
 fn with_state(state: AppState) -> impl Filter<Extract = (AppState,), Error = std::convert::Infallible> + Clone {
@@ -141,10 +137,8 @@ fn with_state(state: AppState) -> impl Filter<Extract = (AppState,), Error = std
 async fn handle_socket(ws: WebSocket, state: AppState) {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let connection_id = Uuid::new_v4().to_string();
     let mut peer_id: Option<String> = None;
 
-    // Спавним задачу отправки сообщений клиенту
     let peers_clone = state.peers.clone();
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -152,13 +146,10 @@ async fn handle_socket(ws: WebSocket, state: AppState) {
                 break;
             }
         }
-        // Очистка при отключении
-        peers_clone.lock().await.remove(&connection_id);
     });
 
-    println!("New WebSocket connection: {}", connection_id);
+    println!("New WebSocket connection");
 
-    // Обработка входящих сообщений
     while let Some(Ok(msg)) = ws_rx.next().await {
         if msg.is_text() {
             if let Ok(signal) = serde_json::from_str::<SignalMessage>(msg.to_str().unwrap()) {
@@ -175,16 +166,13 @@ async fn handle_socket(ws: WebSocket, state: AppState) {
         }
     }
 
-    // Очистка при отключении
     if let Some(pid) = peer_id {
         let mut peers = state.peers.lock().await;
         peers.remove(&pid);
         
-        // Уведомляем других пиров об отключении
         let leave_msg = ResponseMessage::PeerLeft { peerId: pid.clone() };
         broadcast_to_others(&peers, &pid, leave_msg).await;
         
-        // Обновляем счетчик
         let count_msg = ResponseMessage::PeerCount { count: peers.len() };
         broadcast_to_all(&peers, count_msg).await;
         
@@ -202,19 +190,16 @@ async fn handle_signal(
         SignalMessage::Join { peerId } => {
             let mut peers = state.peers.lock().await;
             
-            // Проверяем, не занят ли peerId
             if peers.contains_key(&peerId) {
                 return Err("Peer ID already exists".to_string());
             }
 
-            // Регистрируем пира
             let peer = Peer {
                 tx: tx.clone(),
             };
             peers.insert(peerId.clone(), peer);
             *peer_id = Some(peerId.clone());
 
-            // Отправляем список существующих пиров новому пиру
             let existing_peers: Vec<String> = peers.keys()
                 .filter(|&id| id != &peerId)
                 .cloned()
@@ -223,13 +208,13 @@ async fn handle_signal(
             let peer_list_msg = ResponseMessage::PeerList { peers: existing_peers };
             send_message(tx, peer_list_msg).await;
 
-            // Уведомляем других пиров о новом пире
             let join_msg = ResponseMessage::PeerJoined { peerId: peerId.clone() };
             broadcast_to_others(&peers, &peerId, join_msg).await;
 
-            // Отправляем обновленный счетчик всем
             let count_msg = ResponseMessage::PeerCount { count: peers.len() };
             broadcast_to_all(&peers, count_msg).await;
+            
+            println!("Peer joined: {} (total: {})", peerId, peers.len());
         },
 
         SignalMessage::Offer { peerId: _, targetPeer, offer } => {
