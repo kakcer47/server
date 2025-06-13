@@ -100,15 +100,9 @@ async fn main() {
         peers: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    let cors = warp::cors()
-        .allow_any_origin()
-        .allow_headers(vec!["content-type"])
-        .allow_methods(vec!["GET", "POST", "OPTIONS"]);
-
     let ws_route = warp::path("ws")
         .and(warp::ws())
         .and(with_state(state.clone()))
-        .and(cors)
         .map(|ws: warp::ws::Ws, state| {
             ws.on_upgrade(move |socket| handle_socket(socket, state))
         });
@@ -116,7 +110,12 @@ async fn main() {
     let health = warp::path("health")
         .map(|| "OK");
 
-    let routes = ws_route.or(health);
+    let cors = warp::cors()
+        .allow_any_origin()
+        .allow_headers(vec!["content-type"])
+        .allow_methods(vec!["GET", "POST", "OPTIONS"]);
+
+    let routes = ws_route.or(health).with(cors);
 
     let port = std::env::var("PORT")
         .unwrap_or_else(|_| "8080".to_string())
