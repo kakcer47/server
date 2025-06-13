@@ -1,188 +1,307 @@
 use warp::Filter;
 use warp::ws::{Message, WebSocket};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::Value;
 use uuid::Uuid;
-use reqwest::Client;
 
-// ========== Типы ==========
-type Clients = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Message>>>>;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum SignalMessage {
+    #[serde(rename = "join")]
+    Join { peerId: String },
+    
+    #[serde(rename = "offer")]
+    Offer { 
+        peerId: String, 
+        targetPeer: String, 
+        offer: Value 
+    },
+    
+    #[serde(rename = "answer")]
+    Answer { 
+        peerId: String, 
+        targetPeer: String, 
+        answer: Value 
+    },
+    
+    #[serde(rename = "ice_candidate")]
+    IceCandidate { 
+        peerId: String, 
+        targetPeer: String, 
+        candidate: Value 
+    },
+    
+    #[serde(rename = "broadcast")]
+    Broadcast { message: Value },
+    
+    #[serde(rename = "leave")]
+    Leave { peerId: String },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+enum ResponseMessage {
+    #[serde(rename = "peer_joined")]
+    PeerJoined { peerId: String },
+    
+    #[serde(rename = "peer_left")]
+    PeerLeft { peerId: String },
+    
+    #[serde(rename = "peer_list")]
+    PeerList { peers: Vec<String> },
+    
+    #[serde(rename = "peer_count")]
+    PeerCount { count: usize },
+    
+    #[serde(rename = "offer")]
+    Offer { 
+        peerId: String, 
+        offer: Value 
+    },
+    
+    #[serde(rename = "answer")]
+    Answer { 
+        peerId: String, 
+        answer: Value 
+    },
+    
+    #[serde(rename = "ice_candidate")]
+    IceCandidate { 
+        peerId: String, 
+        candidate: Value 
+    },
+    
+    #[serde(rename = "message")]
+    Message { message: Value },
+    
+    #[serde(rename = "error")]
+    Error { error: String },
+}
+
+struct Peer {
+    id: String,
+    tx: mpsc::UnboundedSender<Message>,
+}
+
+type Peers = Arc<Mutex<HashMap<String, Peer>>>;
 
 #[derive(Clone)]
 struct AppState {
-    clients: Clients,
-    http: Client,
-    supabase_url: String,
-    supabase_key: String,
+    peers: Peers,
 }
 
-// ========== Точка входа ==========
 #[tokio::main]
 async fn main() {
     let state = AppState {
-        clients: Arc::new(Mutex::new(HashMap::new())),
-        http: Client::new(),
-        supabase_url: std::env::var("SUPABASE_URL").expect("SUPABASE_URL not set"),
-        supabase_key: std::env::var("SUPABASE_KEY").expect("SUPABASE_KEY not set"),
+        peers: Arc::new(Mutex::new(HashMap::new())),
     };
+
+    let cors = warp::cors()
+        .allow_any_origin()
+        .allow_headers(vec!["content-type"])
+        .allow_methods(vec!["GET", "POST", "OPTIONS"]);
 
     let ws_route = warp::path("ws")
         .and(warp::ws())
         .and(with_state(state.clone()))
+        .and(cors)
         .map(|ws: warp::ws::Ws, state| {
             ws.on_upgrade(move |socket| handle_socket(socket, state))
         });
 
-    println!("🚀 WebSocket server running on ws://0.0.0.0:8080");
-    warp::serve(ws_route).run(([0, 0, 0, 0], 8080)).await;
+    let health = warp::path("health")
+        .map(|| "OK");
+
+    let routes = ws_route.or(health);
+
+    let port = std::env::var("PORT")
+        .unwrap_or_else(|_| "8080".to_string())
+        .parse::<u16>()
+        .expect("PORT must be a valid number");
+
+    println!("🚀 P2P Signaling Server запущен на ws://0.0.0.0:{}", port);
+    warp::serve(routes).run(([0, 0, 0, 0], port)).await;
 }
 
 fn with_state(state: AppState) -> impl Filter<Extract = (AppState,), Error = std::convert::Infallible> + Clone {
     warp::any().map(move || state.clone())
 }
 
-// ========== Обработка соединения ==========
 async fn handle_socket(ws: WebSocket, state: AppState) {
     let (mut ws_tx, mut ws_rx) = ws.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-    let client_id = Uuid::new_v4().to_string();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let connection_id = Uuid::new_v4().to_string();
+    let mut peer_id: Option<String> = None;
 
-    // Регистрируем нового клиента
-    {
-        let mut clients = state.clients.lock().await;
-        clients.insert(client_id.clone(), tx);
-    }
-
-    // Задача для отправки сообщений клиенту
-    let clients = state.clients.clone();
-    let client_id_clone = client_id.clone();
+    // Спавним задачу отправки сообщений клиенту
+    let peers_clone = state.peers.clone();
+    let connection_id_clone = connection_id.clone();
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if ws_tx.send(msg).await.is_err() {
                 break;
             }
         }
-        // Удаляем клиента при разрыве соединения
-        clients.lock().await.remove(&client_id_clone);
+        // Очистка при отключении
+        peers_clone.lock().await.remove(&connection_id_clone);
     });
 
-    // Приём сообщений от клиента
-    while let Some(result) = ws_rx.next().await {
-        if let Ok(msg) = result {
-            if msg.is_text() {
-                if let Ok(value) = serde_json::from_str::<Value>(msg.to_str().unwrap()) {
-                    handle_message(value, &client_id, &state).await;
-                }
-            }
-        }
-    }
-}
-
-// ========== Обработка сообщений ==========
-async fn handle_message(msg: Value, client_id: &str, state: &AppState) {
-    match msg.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-        "Publish" => {
-            if let Some(entry) = msg.get("message") {
-                if let Err(e) = save_entry_to_supabase(entry.clone(), state).await {
-                    eprintln!("Failed to save entry to Supabase: {}", e);
-                } else {
-                    broadcast_to_others(client_id, entry.clone(), state).await;
-                }
-            }
-        }
-        "Like" => {
-            if let (Some(entry_id), Some(telegram_id)) = (msg.get("entry_id"), msg.get("telegram_id")) {
-                if let (Some(entry_id), Some(telegram_id)) = (entry_id.as_i64(), telegram_id.as_i64()) {
-                    if let Err(e) = toggle_like(entry_id, telegram_id, state).await {
-                        eprintln!("Failed to toggle like: {}", e);
+    // Обработка входящих сообщений
+    while let Some(Ok(msg)) = ws_rx.next().await {
+        if msg.is_text() {
+            if let Ok(signal) = serde_json::from_str::<SignalMessage>(msg.to_str().unwrap()) {
+                match handle_signal(signal, &mut peer_id, &connection_id, &tx, &state).await {
+                    Ok(_) => {},
+                    Err(e) => {
+                        let error_msg = ResponseMessage::Error { error: e };
+                        send_message(&tx, error_msg).await;
                     }
                 }
             }
-        }
-        _ => {}
-    }
-}
-
-// ========== Поиск или создание пользователя ==========
-async fn get_or_create_user(telegram_id: i64, state: &AppState) -> Result<i64, reqwest::Error> {
-    let response = state.http
-        .get(format!("{}/rest/v1/users?telegram_id=eq.{}", state.supabase_url, telegram_id))
-        .bearer_auth(&state.supabase_key)
-        .header("apikey", &state.supabase_key)
-        .send()
-        .await?;
-
-    let users: Vec<Value> = response.json().await?;
-    if let Some(user) = users.first() {
-        return Ok(user["id"].as_i64().unwrap());
-    }
-
-    let new_user = serde_json::json!({
-        "telegram_id": telegram_id,
-        "name": "New User",
-        "username": format!("user{}", telegram_id),
-        "avatar": null
-    });
-
-    let response = state.http
-        .post(format!("{}/rest/v1/users", state.supabase_url))
-        .bearer_auth(&state.supabase_key)
-        .header("apikey", &state.supabase_key)
-        .json(&new_user)
-        .send()
-        .await?;
-
-    let created_user: Vec<Value> = response.json().await?;
-    Ok(created_user[0]["id"].as_i64().unwrap())
-}
-
-// ========== Сохранение записи в Supabase ==========
-async fn save_entry_to_supabase(mut entry: Value, state: &AppState) -> Result<(), reqwest::Error> {
-    if let Some(creator_telegram_id) = entry.get("creator_telegram_id").and_then(|v| v.as_str()) {
-        let telegram_id = creator_telegram_id.parse::<i64>().unwrap_or(0);
-        let user_id = get_or_create_user(telegram_id, state).await?;
-        if let Some(obj) = entry.as_object_mut() {
-            obj.insert("creator_id".to_string(), serde_json::json!(user_id));
+        } else if msg.is_close() {
+            break;
         }
     }
 
-    state.http
-        .post(format!("{}/rest/v1/entries", state.supabase_url))
-        .bearer_auth(&state.supabase_key)
-        .header("apikey", &state.supabase_key)
-        .json(&entry)
-        .send()
-        .await?;
+    // Очистка при отключении
+    if let Some(pid) = peer_id {
+        let mut peers = state.peers.lock().await;
+        peers.remove(&pid);
+        
+        // Уведомляем других пиров об отключении
+        let leave_msg = ResponseMessage::PeerLeft { peerId: pid.clone() };
+        broadcast_to_others(&peers, &pid, leave_msg).await;
+        
+        // Обновляем счетчик
+        let count_msg = ResponseMessage::PeerCount { count: peers.len() };
+        broadcast_to_all(&peers, count_msg).await;
+    }
+}
 
+async fn handle_signal(
+    signal: SignalMessage,
+    peer_id: &mut Option<String>,
+    connection_id: &str,
+    tx: &mpsc::UnboundedSender<Message>,
+    state: &AppState,
+) -> Result<(), String> {
+    match signal {
+        SignalMessage::Join { peerId } => {
+            let mut peers = state.peers.lock().await;
+            
+            // Проверяем, не занят ли peerId
+            if peers.contains_key(&peerId) {
+                return Err("Peer ID already exists".to_string());
+            }
+
+            // Регистрируем пира
+            let peer = Peer {
+                id: peerId.clone(),
+                tx: tx.clone(),
+            };
+            peers.insert(peerId.clone(), peer);
+            *peer_id = Some(peerId.clone());
+
+            // Отправляем список существующих пиров новому пиру
+            let existing_peers: Vec<String> = peers.keys()
+                .filter(|&id| id != &peerId)
+                .cloned()
+                .collect();
+            
+            let peer_list_msg = ResponseMessage::PeerList { peers: existing_peers };
+            send_message(tx, peer_list_msg).await;
+
+            // Уведомляем других пиров о новом пире
+            let join_msg = ResponseMessage::PeerJoined { peerId: peerId.clone() };
+            broadcast_to_others(&peers, &peerId, join_msg).await;
+
+            // Отправляем обновленный счетчик всем
+            let count_msg = ResponseMessage::PeerCount { count: peers.len() };
+            broadcast_to_all(&peers, count_msg).await;
+        },
+
+        SignalMessage::Offer { peerId: _, targetPeer, offer } => {
+            let peers = state.peers.lock().await;
+            if let Some(target) = peers.get(&targetPeer) {
+                let offer_msg = ResponseMessage::Offer { 
+                    peerId: peer_id.as_ref().unwrap_or(&"unknown".to_string()).clone(),
+                    offer 
+                };
+                send_message(&target.tx, offer_msg).await;
+            }
+        },
+
+        SignalMessage::Answer { peerId: _, targetPeer, answer } => {
+            let peers = state.peers.lock().await;
+            if let Some(target) = peers.get(&targetPeer) {
+                let answer_msg = ResponseMessage::Answer { 
+                    peerId: peer_id.as_ref().unwrap_or(&"unknown".to_string()).clone(),
+                    answer 
+                };
+                send_message(&target.tx, answer_msg).await;
+            }
+        },
+
+        SignalMessage::IceCandidate { peerId: _, targetPeer, candidate } => {
+            let peers = state.peers.lock().await;
+            if let Some(target) = peers.get(&targetPeer) {
+                let ice_msg = ResponseMessage::IceCandidate { 
+                    peerId: peer_id.as_ref().unwrap_or(&"unknown".to_string()).clone(),
+                    candidate 
+                };
+                send_message(&target.tx, ice_msg).await;
+            }
+        },
+
+        SignalMessage::Broadcast { message } => {
+            let peers = state.peers.lock().await;
+            let broadcast_msg = ResponseMessage::Message { message };
+            if let Some(sender_id) = peer_id {
+                broadcast_to_others(&peers, sender_id, broadcast_msg).await;
+            }
+        },
+
+        SignalMessage::Leave { peerId: _ } => {
+            if let Some(pid) = peer_id.take() {
+                let mut peers = state.peers.lock().await;
+                peers.remove(&pid);
+                
+                let leave_msg = ResponseMessage::PeerLeft { peerId: pid.clone() };
+                broadcast_to_others(&peers, &pid, leave_msg).await;
+                
+                let count_msg = ResponseMessage::PeerCount { count: peers.len() };
+                broadcast_to_all(&peers, count_msg).await;
+            }
+        },
+    }
+    
     Ok(())
 }
 
-// ========== Переключение лайка ==========
-async fn toggle_like(entry_id: i64, telegram_id: i64, state: &AppState) -> Result<(), reqwest::Error> {
-    state.http
-        .post(format!("{}/rest/v1/rpc/toggle_like", state.supabase_url))
-        .bearer_auth(&state.supabase_key)
-        .header("apikey", &state.supabase_key)
-        .json(&serde_json::json!({ "entry_id": entry_id, "user_telegram_id": telegram_id }))
-        .send()
-        .await?;
-
-    Ok(())
+async fn send_message(tx: &mpsc::UnboundedSender<Message>, msg: ResponseMessage) {
+    if let Ok(json) = serde_json::to_string(&msg) {
+        let _ = tx.send(Message::text(json));
+    }
 }
 
-// ========== Рассылка сообщений ==========
-async fn broadcast_to_others(sender_id: &str, entry: Value, state: &AppState) {
-    let msg = Message::text(
-        serde_json::json!({ "type": "NewPost", "entry": entry }).to_string(),
-    );
+async fn broadcast_to_others(peers: &HashMap<String, Peer>, sender_id: &str, msg: ResponseMessage) {
+    if let Ok(json) = serde_json::to_string(&msg) {
+        for (id, peer) in peers.iter() {
+            if id != sender_id {
+                let _ = peer.tx.send(Message::text(json.clone()));
+            }
+        }
+    }
+}
 
-    let clients = state.clients.lock().await;
-    for (id, tx) in clients.iter() {
-        if id != sender_id {
-            let _ = tx.send(msg.clone());
+async fn broadcast_to_all(peers: &HashMap<String, Peer>, msg: ResponseMessage) {
+    if let Ok(json) = serde_json::to_string(&msg) {
+        for peer in peers.values() {
+            let _ = peer.tx.send(Message::text(json.clone()));
         }
     }
 }
