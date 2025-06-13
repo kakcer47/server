@@ -85,7 +85,6 @@ enum ResponseMessage {
 }
 
 struct Peer {
-    id: String,
     tx: mpsc::UnboundedSender<Message>,
 }
 
@@ -119,13 +118,20 @@ async fn main() {
 
     let routes = ws_route.or(health).with(cors);
 
+    // Render требует читать PORT из env
     let port = std::env::var("PORT")
         .unwrap_or_else(|_| "8080".to_string())
         .parse::<u16>()
-        .expect("PORT must be a valid number");
+        .unwrap_or(8080);
 
-    println!("🚀 P2P Signaling Server запущен на ws://0.0.0.0:{}", port);
-    warp::serve(routes).run(([0, 0, 0, 0], port)).await;
+    println!("🚀 P2P Signaling Server starting on 0.0.0.0:{}", port);
+    
+    warp::serve(routes)
+        .bind(([0, 0, 0, 0], port))
+        .await;
+    
+    println!("✅ Server started successfully!");
+}
 }
 
 fn with_state(state: AppState) -> impl Filter<Extract = (AppState,), Error = std::convert::Infallible> + Clone {
@@ -140,7 +146,6 @@ async fn handle_socket(ws: WebSocket, state: AppState) {
 
     // Спавним задачу отправки сообщений клиенту
     let peers_clone = state.peers.clone();
-    let connection_id_clone = connection_id.clone();
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if ws_tx.send(msg).await.is_err() {
@@ -148,14 +153,16 @@ async fn handle_socket(ws: WebSocket, state: AppState) {
             }
         }
         // Очистка при отключении
-        peers_clone.lock().await.remove(&connection_id_clone);
+        peers_clone.lock().await.remove(&connection_id);
     });
+
+    println!("New WebSocket connection: {}", connection_id);
 
     // Обработка входящих сообщений
     while let Some(Ok(msg)) = ws_rx.next().await {
         if msg.is_text() {
             if let Ok(signal) = serde_json::from_str::<SignalMessage>(msg.to_str().unwrap()) {
-                match handle_signal(signal, &mut peer_id, &connection_id, &tx, &state).await {
+                match handle_signal(signal, &mut peer_id, &tx, &state).await {
                     Ok(_) => {},
                     Err(e) => {
                         let error_msg = ResponseMessage::Error { error: e };
@@ -180,13 +187,14 @@ async fn handle_socket(ws: WebSocket, state: AppState) {
         // Обновляем счетчик
         let count_msg = ResponseMessage::PeerCount { count: peers.len() };
         broadcast_to_all(&peers, count_msg).await;
+        
+        println!("Peer disconnected: {}", pid);
     }
 }
 
 async fn handle_signal(
     signal: SignalMessage,
     peer_id: &mut Option<String>,
-    connection_id: &str,
     tx: &mpsc::UnboundedSender<Message>,
     state: &AppState,
 ) -> Result<(), String> {
@@ -201,7 +209,6 @@ async fn handle_signal(
 
             // Регистрируем пира
             let peer = Peer {
-                id: peerId.clone(),
                 tx: tx.clone(),
             };
             peers.insert(peerId.clone(), peer);
