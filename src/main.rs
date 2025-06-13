@@ -1,306 +1,371 @@
-use warp::Filter;
-use warp::ws::{Message, WebSocket};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
-use futures_util::{SinkExt, StreamExt};
-use uuid::Uuid;
+import type { P2PMessage, Post } from '../types'
+import { cryptoService } from './crypto'
+import { useStore } from '../store'
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-enum SignalMessage {
-    #[serde(rename = "join")]
-    Join { peerId: String },
-    
-    #[serde(rename = "offer")]
-    Offer { 
-        peerId: String, 
-        targetPeer: String, 
-        offer: Value 
-    },
-    
-    #[serde(rename = "answer")]
-    Answer { 
-        peerId: String, 
-        targetPeer: String, 
-        answer: Value 
-    },
-    
-    #[serde(rename = "ice_candidate")]
-    IceCandidate { 
-        peerId: String, 
-        targetPeer: String, 
-        candidate: Value 
-    },
-    
-    #[serde(rename = "broadcast")]
-    Broadcast { message: Value },
-    
-    #[serde(rename = "leave")]
-    Leave { peerId: String },
+interface RTCPeer {
+  id: string
+  connection: RTCPeerConnection
+  dataChannel?: RTCDataChannel
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type")]
-enum ResponseMessage {
-    #[serde(rename = "peer_joined")]
-    PeerJoined { peerId: String },
-    
-    #[serde(rename = "peer_left")]
-    PeerLeft { peerId: String },
-    
-    #[serde(rename = "peer_list")]
-    PeerList { peers: Vec<String> },
-    
-    #[serde(rename = "peer_count")]
-    PeerCount { count: usize },
-    
-    #[serde(rename = "offer")]
-    Offer { 
-        peerId: String, 
-        offer: Value 
-    },
-    
-    #[serde(rename = "answer")]
-    Answer { 
-        peerId: String, 
-        answer: Value 
-    },
-    
-    #[serde(rename = "ice_candidate")]
-    IceCandidate { 
-        peerId: String, 
-        candidate: Value 
-    },
-    
-    #[serde(rename = "message")]
-    Message { message: Value },
-    
-    #[serde(rename = "error")]
-    Error { error: String },
+interface SignalMessage {
+  type: 'join' | 'offer' | 'answer' | 'ice_candidate' | 'broadcast' | 'leave'
+  peerId?: string
+  targetPeer?: string
+  offer?: RTCSessionDescriptionInit
+  answer?: RTCSessionDescriptionInit
+  candidate?: RTCIceCandidateInit
+  message?: any
 }
 
-struct Peer {
-    id: String,
-    tx: mpsc::UnboundedSender<Message>,
+interface ResponseMessage {
+  type: 'peer_joined' | 'peer_left' | 'peer_list' | 'peer_count' | 'offer' | 'answer' | 'ice_candidate' | 'message' | 'error'
+  peerId?: string
+  peers?: string[]
+  count?: number
+  offer?: RTCSessionDescriptionInit
+  answer?: RTCSessionDescriptionInit
+  candidate?: RTCIceCandidateInit
+  message?: any
+  error?: string
 }
 
-type Peers = Arc<Mutex<HashMap<String, Peer>>>;
+class P2PService {
+  private signalingWs: WebSocket | null = null
+  private peers = new Map<string, RTCPeer>()
+  private messageHandlers = new Map<string, (data: any) => void>()
+  private localPeerId: string = ''
+  private reconnectInterval: number | null = null
+  private activePeers = new Set<string>()
 
-#[derive(Clone)]
-struct AppState {
-    peers: Peers,
-}
+  async init(): Promise<void> {
+    this.localPeerId = cryptoService.generateId()
+    this.connectSignaling()
+  }
 
-#[tokio::main]
-async fn main() {
-    let state = AppState {
-        peers: Arc::new(Mutex::new(HashMap::new())),
-    };
+  private connectSignaling(): void {
+    try {
+      // Используй свой Render сервер  
+      this.signalingWs = new WebSocket('wss://your-app-name.onrender.com/ws')
+      
+      this.signalingWs.onopen = () => {
+        console.log('Signaling connected')
+        this.sendSignaling({ type: 'join', peerId: this.localPeerId })
+      }
 
-    let ws_route = warp::path("ws")
-        .and(warp::ws())
-        .and(with_state(state.clone()))
-        .map(|ws: warp::ws::Ws, state| {
-            ws.on_upgrade(move |socket| handle_socket(socket, state))
-        });
+      this.signalingWs.onclose = () => {
+        this.scheduleReconnect()
+        useStore.getState().setConnected(false)
+      }
 
-    let health = warp::path("health")
-        .map(|| "OK");
+      this.signalingWs.onerror = () => {
+        this.scheduleReconnect()
+      }
 
-    let cors = warp::cors()
-        .allow_any_origin()
-        .allow_headers(vec!["content-type"])
-        .allow_methods(vec!["GET", "POST", "OPTIONS"]);
+      this.signalingWs.onmessage = async (event) => {
+        const message: ResponseMessage = JSON.parse(event.data)
+        await this.handleSignaling(message)
+      }
+    } catch (error) {
+      this.scheduleReconnect()
+    }
+  }
 
-    let routes = ws_route.or(health).with(cors);
+  private scheduleReconnect(): void {
+    if (this.reconnectInterval) return
+    this.reconnectInterval = window.setTimeout(() => {
+      this.reconnectInterval = null
+      this.connectSignaling()
+    }, 3000)
+  }
 
-    let port = std::env::var("PORT")
-        .unwrap_or_else(|_| "8080".to_string())
-        .parse::<u16>()
-        .expect("PORT must be a valid number");
-
-    println!("🚀 P2P Signaling Server запущен на ws://0.0.0.0:{}", port);
-    warp::serve(routes).run(([0, 0, 0, 0], port)).await;
-}
-
-fn with_state(state: AppState) -> impl Filter<Extract = (AppState,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || state.clone())
-}
-
-async fn handle_socket(ws: WebSocket, state: AppState) {
-    let (mut ws_tx, mut ws_rx) = ws.split();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let connection_id = Uuid::new_v4().to_string();
-    let mut peer_id: Option<String> = None;
-
-    // Спавним задачу отправки сообщений клиенту
-    let peers_clone = state.peers.clone();
-    let connection_id_clone = connection_id.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if ws_tx.send(msg).await.is_err() {
-                break;
-            }
+  private async handleSignaling(message: ResponseMessage): Promise<void> {
+    switch (message.type) {
+      case 'peer_list':
+        // Подключаемся ко всем существующим пирам
+        if (message.peers) {
+          for (const peerId of message.peers) {
+            await this.createPeerConnection(peerId, true)
+          }
         }
-        // Очистка при отключении
-        peers_clone.lock().await.remove(&connection_id_clone);
-    });
+        break
 
-    // Обработка входящих сообщений
-    while let Some(Ok(msg)) = ws_rx.next().await {
-        if msg.is_text() {
-            if let Ok(signal) = serde_json::from_str::<SignalMessage>(msg.to_str().unwrap()) {
-                match handle_signal(signal, &mut peer_id, &connection_id, &tx, &state).await {
-                    Ok(_) => {},
-                    Err(e) => {
-                        let error_msg = ResponseMessage::Error { error: e };
-                        send_message(&tx, error_msg).await;
-                    }
-                }
-            }
-        } else if msg.is_close() {
-            break;
+      case 'peer_joined':
+        if (message.peerId && message.peerId !== this.localPeerId) {
+          this.activePeers.add(message.peerId)
+          // Новый пир подключился, но мы не инициируем соединение
+          // Он сам инициирует offer к нам
         }
+        break
+
+      case 'peer_left':
+        if (message.peerId) {
+          this.activePeers.delete(message.peerId)
+          this.peers.delete(message.peerId)
+          this.updatePeerCount()
+        }
+        break
+
+      case 'peer_count':
+        useStore.getState().setPeerCount(message.count || 0)
+        if (message.count && message.count > 0) {
+          useStore.getState().setConnected(true)
+        }
+        break
+
+      case 'offer':
+        if (message.peerId && message.offer) {
+          await this.handleOffer(message.peerId, message.offer)
+        }
+        break
+
+      case 'answer':
+        if (message.peerId && message.answer) {
+          await this.handleAnswer(message.peerId, message.answer)
+        }
+        break
+
+      case 'ice_candidate':
+        if (message.peerId && message.candidate) {
+          await this.handleIceCandidate(message.peerId, message.candidate)
+        }
+        break
+
+      case 'message':
+        if (message.message) {
+          await this.handlePeerMessage(message.message)
+        }
+        break
+
+      case 'error':
+        console.error('Signaling error:', message.error)
+        break
+    }
+  }
+
+  private async createPeerConnection(peerId: string, isInitiator: boolean): Promise<void> {
+    const config: RTCConfiguration = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+      ]
     }
 
-    // Очистка при отключении
-    if let Some(pid) = peer_id {
-        let mut peers = state.peers.lock().await;
-        peers.remove(&pid);
-        
-        // Уведомляем других пиров об отключении
-        let leave_msg = ResponseMessage::PeerLeft { peerId: pid.clone() };
-        broadcast_to_others(&peers, &pid, leave_msg).await;
-        
-        // Обновляем счетчик
-        let count_msg = ResponseMessage::PeerCount { count: peers.len() };
-        broadcast_to_all(&peers, count_msg).await;
+    const connection = new RTCPeerConnection(config)
+    let dataChannel: RTCDataChannel | undefined
+
+    if (isInitiator) {
+      dataChannel = connection.createDataChannel('data', { ordered: true })
+      this.setupDataChannel(dataChannel, peerId)
     }
-}
 
-async fn handle_signal(
-    signal: SignalMessage,
-    peer_id: &mut Option<String>,
-    connection_id: &str,
-    tx: &mpsc::UnboundedSender<Message>,
-    state: &AppState,
-) -> Result<(), String> {
-    match signal {
-        SignalMessage::Join { peerId } => {
-            let mut peers = state.peers.lock().await;
-            
-            // Проверяем, не занят ли peerId
-            if peers.contains_key(&peerId) {
-                return Err("Peer ID already exists".to_string());
-            }
-
-            // Регистрируем пира
-            let peer = Peer {
-                id: peerId.clone(),
-                tx: tx.clone(),
-            };
-            peers.insert(peerId.clone(), peer);
-            *peer_id = Some(peerId.clone());
-
-            // Отправляем список существующих пиров новому пиру
-            let existing_peers: Vec<String> = peers.keys()
-                .filter(|&id| id != &peerId)
-                .cloned()
-                .collect();
-            
-            let peer_list_msg = ResponseMessage::PeerList { peers: existing_peers };
-            send_message(tx, peer_list_msg).await;
-
-            // Уведомляем других пиров о новом пире
-            let join_msg = ResponseMessage::PeerJoined { peerId: peerId.clone() };
-            broadcast_to_others(&peers, &peerId, join_msg).await;
-
-            // Отправляем обновленный счетчик всем
-            let count_msg = ResponseMessage::PeerCount { count: peers.len() };
-            broadcast_to_all(&peers, count_msg).await;
-        },
-
-        SignalMessage::Offer { peerId: _, targetPeer, offer } => {
-            let peers = state.peers.lock().await;
-            if let Some(target) = peers.get(&targetPeer) {
-                let offer_msg = ResponseMessage::Offer { 
-                    peerId: peer_id.as_ref().unwrap_or(&"unknown".to_string()).clone(),
-                    offer 
-                };
-                send_message(&target.tx, offer_msg).await;
-            }
-        },
-
-        SignalMessage::Answer { peerId: _, targetPeer, answer } => {
-            let peers = state.peers.lock().await;
-            if let Some(target) = peers.get(&targetPeer) {
-                let answer_msg = ResponseMessage::Answer { 
-                    peerId: peer_id.as_ref().unwrap_or(&"unknown".to_string()).clone(),
-                    answer 
-                };
-                send_message(&target.tx, answer_msg).await;
-            }
-        },
-
-        SignalMessage::IceCandidate { peerId: _, targetPeer, candidate } => {
-            let peers = state.peers.lock().await;
-            if let Some(target) = peers.get(&targetPeer) {
-                let ice_msg = ResponseMessage::IceCandidate { 
-                    peerId: peer_id.as_ref().unwrap_or(&"unknown".to_string()).clone(),
-                    candidate 
-                };
-                send_message(&target.tx, ice_msg).await;
-            }
-        },
-
-        SignalMessage::Broadcast { message } => {
-            let peers = state.peers.lock().await;
-            let broadcast_msg = ResponseMessage::Message { message };
-            if let Some(sender_id) = peer_id {
-                broadcast_to_others(&peers, sender_id, broadcast_msg).await;
-            }
-        },
-
-        SignalMessage::Leave { peerId: _ } => {
-            if let Some(pid) = peer_id.take() {
-                let mut peers = state.peers.lock().await;
-                peers.remove(&pid);
-                
-                let leave_msg = ResponseMessage::PeerLeft { peerId: pid.clone() };
-                broadcast_to_others(&peers, &pid, leave_msg).await;
-                
-                let count_msg = ResponseMessage::PeerCount { count: peers.len() };
-                broadcast_to_all(&peers, count_msg).await;
-            }
-        },
+    connection.ondatachannel = (event) => {
+      dataChannel = event.channel
+      this.setupDataChannel(event.channel, peerId)
     }
+
+    connection.onicecandidate = (event) => {
+      if (event.candidate) {
+        this.sendSignaling({
+          type: 'ice_candidate',
+          peerId: this.localPeerId,
+          targetPeer: peerId,
+          candidate: event.candidate
+        })
+      }
+    }
+
+    connection.onconnectionstatechange = () => {
+      console.log(`Peer ${peerId} connection state:`, connection.connectionState)
+      if (connection.connectionState === 'connected') {
+        this.updatePeerCount()
+      } else if (connection.connectionState === 'disconnected' || connection.connectionState === 'failed') {
+        this.peers.delete(peerId)
+        this.updatePeerCount()
+      }
+    }
+
+    this.peers.set(peerId, { id: peerId, connection, dataChannel })
+
+    if (isInitiator) {
+      const offer = await connection.createOffer()
+      await connection.setLocalDescription(offer)
+      this.sendSignaling({
+        type: 'offer',
+        peerId: this.localPeerId,
+        targetPeer: peerId,
+        offer
+      })
+    }
+  }
+
+  private setupDataChannel(channel: RTCDataChannel, peerId: string): void {
+    channel.onopen = () => {
+      console.log(`DataChannel opened with ${peerId}`)
+      const peer = this.peers.get(peerId)
+      if (peer) {
+        peer.dataChannel = channel
+        this.updatePeerCount()
+      }
+    }
+
+    channel.onmessage = (event) => {
+      this.handlePeerMessage(JSON.parse(event.data))
+    }
+
+    channel.onerror = (error) => {
+      console.error(`DataChannel error with ${peerId}:`, error)
+    }
+  }
+
+  private updatePeerCount(): void {
+    const connectedPeers = Array.from(this.peers.values())
+      .filter(peer => peer.dataChannel?.readyState === 'open').length
     
-    Ok(())
+    useStore.getState().setPeerCount(connectedPeers)
+    useStore.getState().setConnected(connectedPeers > 0 || this.signalingWs?.readyState === WebSocket.OPEN)
+  }
+
+  private async handleOffer(peerId: string, offer: RTCSessionDescriptionInit): Promise<void> {
+    await this.createPeerConnection(peerId, false)
+    const peer = this.peers.get(peerId)
+    if (!peer) return
+
+    await peer.connection.setRemoteDescription(offer)
+    const answer = await peer.connection.createAnswer()
+    await peer.connection.setLocalDescription(answer)
+
+    this.sendSignaling({
+      type: 'answer',
+      peerId: this.localPeerId,
+      targetPeer: peerId,
+      answer
+    })
+  }
+
+  private async handleAnswer(peerId: string, answer: RTCSessionDescriptionInit): Promise<void> {
+    const peer = this.peers.get(peerId)
+    if (peer) {
+      await peer.connection.setRemoteDescription(answer)
+    }
+  }
+
+  private async handleIceCandidate(peerId: string, candidate: RTCIceCandidateInit): Promise<void> {
+    const peer = this.peers.get(peerId)
+    if (peer) {
+      await peer.connection.addIceCandidate(candidate)
+    }
+  }
+
+  private sendSignaling(message: SignalMessage): void {
+    if (this.signalingWs?.readyState === WebSocket.OPEN) {
+      this.signalingWs.send(JSON.stringify(message))
+    }
+  }
+
+  private async handlePeerMessage(envelope: any): Promise<void> {
+    try {
+      const message: P2PMessage = envelope.message || envelope
+      if (!message) return
+
+      const isValid = await cryptoService.verifySignature(
+        JSON.stringify(message.data),
+        message.signature,
+        message.author
+      )
+
+      if (!isValid) return
+
+      const handler = this.messageHandlers.get(message.type)
+      if (handler) {
+        handler(message.data)
+      }
+    } catch (error) {
+      console.error('Peer message error:', error)
+    }
+  }
+
+  async publishPost(post: Post): Promise<void> {
+    await this.publishMessage('post', post)
+  }
+
+  async publishLike(postId: string, userId: string): Promise<void> {
+    await this.publishMessage('like', { postId, userId })
+  }
+
+  async publishUnlike(postId: string, userId: string): Promise<void> {
+    await this.publishMessage('unlike', { postId, userId })
+  }
+
+  private async publishMessage(type: string, data: any): Promise<void> {
+    const user = useStore.getState().user
+    if (!user) return
+
+    const message: P2PMessage = {
+      type: type as any,
+      data,
+      timestamp: Date.now(),
+      author: user.publicKey,
+      signature: await cryptoService.signMessage(JSON.stringify(data), user.privateKey)
+    }
+
+    // Отправляем через WebRTC DataChannels
+    let sentViaPeers = false
+    this.peers.forEach((peer) => {
+      if (peer.dataChannel?.readyState === 'open') {
+        peer.dataChannel.send(JSON.stringify({ message }))
+        sentViaPeers = true
+      }
+    })
+
+    // Fallback через WebSocket если нет P2P соединений
+    if (!sentViaPeers && this.signalingWs?.readyState === WebSocket.OPEN) {
+      this.sendSignaling({
+        type: 'broadcast',
+        message: { message }
+      })
+    }
+  }
+
+  subscribe(messageType: string, handler: (data: any) => void): void {
+    this.messageHandlers.set(messageType, handler)
+  }
+
+  async connectToPeer(peerId: string): Promise<void> {
+    if (!this.peers.has(peerId) && this.activePeers.has(peerId)) {
+      await this.createPeerConnection(peerId, true)
+    }
+  }
+
+  getPeerCount(): number {
+    return Array.from(this.peers.values())
+      .filter(peer => peer.dataChannel?.readyState === 'open').length
+  }
+
+  async stop(): Promise<void> {
+    if (this.reconnectInterval) {
+      clearTimeout(this.reconnectInterval)
+      this.reconnectInterval = null
+    }
+
+    // Уведомляем о disconnection
+    if (this.signalingWs?.readyState === WebSocket.OPEN) {
+      this.sendSignaling({ type: 'leave', peerId: this.localPeerId })
+    }
+
+    this.peers.forEach((peer) => {
+      peer.connection.close()
+    })
+    this.peers.clear()
+
+    if (this.signalingWs) {
+      this.signalingWs.close()
+      this.signalingWs = null
+    }
+
+    useStore.getState().setConnected(false)
+    useStore.getState().setPeerCount(0)
+  }
 }
 
-async fn send_message(tx: &mpsc::UnboundedSender<Message>, msg: ResponseMessage) {
-    if let Ok(json) = serde_json::to_string(&msg) {
-        let _ = tx.send(Message::text(json));
-    }
-}
-
-async fn broadcast_to_others(peers: &HashMap<String, Peer>, sender_id: &str, msg: ResponseMessage) {
-    if let Ok(json) = serde_json::to_string(&msg) {
-        for (id, peer) in peers.iter() {
-            if id != sender_id {
-                let _ = peer.tx.send(Message::text(json.clone()));
-            }
-        }
-    }
-}
-
-async fn broadcast_to_all(peers: &HashMap<String, Peer>, msg: ResponseMessage) {
-    if let Ok(json) = serde_json::to_string(&msg) {
-        for peer in peers.values() {
-            let _ = peer.tx.send(Message::text(json.clone()));
-        }
-    }
-}
+export const p2pService = new P2PService()
