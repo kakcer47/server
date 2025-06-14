@@ -1,0 +1,22 @@
+[package]
+name = "p2p-ws-server"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+warp = "0.3"
+tokio-tungstenite = "0.20"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dotenv = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+uuid = { version = "1.0", features = ["v4"] }
+dashmap = "5.5"
+lz4_flex = "0.11"
+rmp-serde = "1.1"
