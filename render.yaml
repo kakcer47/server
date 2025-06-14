@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: p2p-websocket-server
+    env: rust
+    buildCommand: |
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      source ~/.cargo/env
+      cargo build --release
+    startCommand: ./target/release/p2p-ws-server
+    envVars:
+      - key: RUST_LOG
+        value: info
+      - key: PORT
+        fromService:
+          type: web
+          name: p2p-websocket-server
+          property: port
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false # Set manually in Render dashboard
+    healthCheckPath: /health
+    disk:
+      name: p2p-data
+      sizeGB: 1
+      mountPath: /data
