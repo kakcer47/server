@@ -5,7 +5,7 @@ FROM rust:1.82 as builder
 WORKDIR /usr/src/app
 
 # Копируем Cargo.toml и Cargo.lock отдельно для кэширования зависимостей
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 COPY src ./src
 
 # Опционально: если есть другие файлы (например .env или миграции), добавь их:
