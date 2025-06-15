@@ -12,7 +12,7 @@ RUN cargo build --release
 FROM scratch
 
 # Копируем только бинарник из предыдущего этапа
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/server /server
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/p2p-server /server
 
 # Запускаем
 ENTRYPOINT ["/server"]
