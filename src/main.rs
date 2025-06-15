@@ -1,8 +1,3 @@
-//! main.rs — Minimal WebSocket Signaling Server in Rust
-//! - Pure in-memory relay (no persistence)
-//! - Broadcasts incoming messages to all other connected clients
-//! - Zero external dependencies beyond Warp and Tokio
-
 use std::{convert::Infallible, net::SocketAddr, sync::Arc};
 use futures::{StreamExt, SinkExt};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
