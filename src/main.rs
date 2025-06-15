@@ -1,662 +1,336 @@
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
-use dotenv::dotenv;
-use futures::{FutureExt, StreamExt, SinkExt};
+//! main.rs — Production-ready autonomous P2P WebSocket server
+//! - In-memory & on-disk persistence (Sled)
+//! - Create/Edit/Delete/Like operations
+//! - Telegram WebApp auth
+//! - UUID post IDs, HMAC signatures
+//! - Memory metrics via sysinfo
+//! - Parallel Tokio tasks
+//! - Optional TLS via Rustls if CERT_PATH & KEY_PATH provided
+
+use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use futures::{StreamExt, SinkExt};
+use tokio::sync::{mpsc::UnboundedSender, RwLock};
+use warp::{Filter, Reply};
+use warp::ws::{Message, Ws};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
-use tokio_tungstenite::tungstenite::Message;
-use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
-use warp::{filters::BoxedFilter, ws::Ws, Filter, Reply};
+use uuid::Uuid;
+use hmac::{Hmac, Mac}; use sha2::Sha256;
 use dashmap::DashMap;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sled::Db;
+use sysinfo::{System, SystemExt};
+use tracing::{info, error};
 
+// Type aliases
 type HmacSha256 = Hmac<Sha256>;
-
-// === TYPES ===
 type ClientId = String;
-type Clients = Arc<DashMap<ClientId, Client>>;
 
-#[derive(Debug, Clone)]
-struct Client {
-    sender: tokio::sync::mpsc::UnboundedSender<Message>,
-    user_id: u32,
-    master_key: String,
-    joined_at: u64,
-    last_sync: u64,
+// === Data Structures ===
+#[derive(Clone)]
+struct AppState {
+    clients: Arc<DashMap<ClientId, Client>>,
+    posts: Arc<DashMap<String, CompactPost>>,
+    operations: Arc<RwLock<Vec<PostOperation>>> ,
+    user_keys: Arc<DashMap<u32, String>>,
+    db: Db,
+    bot_token: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct TelegramAuth {
-    id: u32,
-    username: Option<String>,
-    first_name: String,
-    auth_date: u64,
-    hash: String,
-}
+#[derive(Clone)]
+struct Client { sender: UnboundedSender<Message>, user_id: u32, master_key: String }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
+struct TelegramAuth { id: u32, username: Option<String>, first_name: String, auth_date: u64, hash: String }
+
+#[derive(Serialize, Deserialize, Clone)]
 struct CompactPost {
-    id: u32,
+    id: String,
     author: u32,
-    title_hash: u32,
-    content_hash: u32,
-    timestamp: u32,
+    title: String,
+    content: String,
+    timestamp: u64,
     likes: u16,
-    tags: u16,
-    meta: u16,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct WsMessage {
-    #[serde(rename = "type")]
-    msg_type: String,
-    auth: Option<TelegramAuth>,
-    master_key: Option<String>,
-    data: Option<serde_json::Value>,
-    timestamp: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct PostOperation {
-    op_type: String, // "create", "like", "edit", "delete"
+    op_type: String,
     post: Option<CompactPost>,
-    post_id: Option<u32>,
+    post_id: Option<String>,
     user_id: u32,
     timestamp: u64,
     signature: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct DeltaSync {
-    operations: Vec<PostOperation>,
-    string_pool: Vec<(u32, String)>, // hash -> string
-    since_timestamp: u64,
-    merkle_root: String,
+#[derive(Serialize, Deserialize)]
+struct WsMessageIn {
+    #[serde(rename="type")] msg_type: String,
+    auth: Option<TelegramAuth>,
+    master_key: Option<String>,
+    data: Option<serde_json::Value>,
 }
 
-// === GLOBALS ===
-struct AppState {
-    clients: Clients,
-    posts: Arc<DashMap<u32, CompactPost>>,
-    string_pool: Arc<DashMap<u32, String>>,
-    operations: Arc<RwLock<Vec<PostOperation>>>,
-    user_keys: Arc<DashMap<u32, String>>, // telegram_id -> master_key
-    bot_token: String,
-}
+#[derive(Serialize)]
+struct WsMessageOut<T: Serialize> { #[serde(rename="type")] msg_type: String, #[serde(flatten)] inner: T }
+
+#[derive(Serialize)]
+struct AuthSuccess { user_id: u32, master_key: String, timestamp: u64 }
+
+#[derive(Serialize)]
+struct Health { status: &'static str, memory_mb: u64 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+async fn main() -> anyhow::Result<()> {
+    dotenv::dotenv().ok();
+    tracing_subscriber::fmt().init();
 
-    let bot_token = std::env::var("TELEGRAM_BOT_TOKEN")
-        .expect("TELEGRAM_BOT_TOKEN must be set");
+    let bot_token = std::env::var("TELEGRAM_BOT_TOKEN").expect("set TELEGRAM_BOT_TOKEN");
+    let db = sled::open("p2p_ws.db")?;
 
+    // Initialize state
     let state = Arc::new(AppState {
         clients: Arc::new(DashMap::new()),
         posts: Arc::new(DashMap::new()),
-        string_pool: Arc::new(DashMap::new()),
         operations: Arc::new(RwLock::new(Vec::new())),
         user_keys: Arc::new(DashMap::new()),
+        db,
         bot_token,
     });
 
-    // Preload common strings
-    init_string_pool(&state.string_pool).await;
+    // Load persisted user_keys
+    let uk = state.db.open_tree("user_keys")?;
+    for item in uk.iter() {
+        let (k, v) = item?;
+        let id = u32::from_le_bytes(k.as_ref().try_into().unwrap());
+        let key = String::from_utf8(v.to_vec())?;
+        state.user_keys.insert(id, key);
+    }
 
-    // WebSocket route
-    let ws_route = warp::path("ws")
-        .and(warp::ws())
-        .and(with_state(state.clone()))
-        .and_then(ws_handler);
+    // Load persisted posts and operations
+    let pt = state.db.open_tree("posts")?;
+    for item in pt.iter() {
+        let (k, v) = item?;
+        let post: CompactPost = serde_json::from_slice(&v)?;
+        state.posts.insert(String::from_utf8(k.to_vec())?, post);
+    }
+    let ot = state.db.open_tree("operations")?;
+    for item in ot.iter() {
+        let (_, v) = item?;
+        let op: PostOperation = serde_json::from_slice(&v)?;
+        state.operations.write().await.push(op);
+    }
 
-    // Health check
-    let health = warp::path("health")
-        .map({
-            let state = state.clone();
-            move || {
-                let stats = serde_json::json!({
-                    "status": "healthy",
-                    "clients": state.clients.len(),
-                    "posts": state.posts.len(),
-                    "uptime": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-                    "memory_mb": get_memory_usage(),
-                });
-                warp::reply::json(&stats)
-            }
-        });
+    // Routes
+    let state_filter = warp::any().map(move || state.clone());
+    let ws_route = warp::path("ws").and(warp::ws()).and(state_filter.clone()).and_then(ws_handler);
+    let health = warp::path("health").map(|| warp::reply::json(&Health { status: "ok", memory_mb: current_memory_mb() }));
+    let routes = ws_route.or(health).with(warp::cors().allow_any_origin());
 
-    // Stats endpoint
-    let stats = warp::path("stats")
-        .map({
-            let state = state.clone();
-            move || {
-                let operations_count = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        state.operations.read().await.len()
-                    })
-                });
-                
-                let stats = serde_json::json!({
-                    "total_clients": state.clients.len(),
-                    "total_posts": state.posts.len(),
-                    "total_operations": operations_count,
-                    "string_pool_size": state.string_pool.len(),
-                    "registered_users": state.user_keys.len(),
-                    "compression_ratio": calculate_compression_ratio(&state),
-                });
-                warp::reply::json(&stats)
-            }
-        });
+    // Start server (with optional TLS)
+    let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8080".into()).parse()?;
+    let addr = SocketAddr::from(([0,0,0,0], port));
+    info!("🚀 Server listening on {}", addr);
 
-    // CORS
-    let cors = warp::cors()
-        .allow_any_origin()
-        .allow_headers(vec!["content-type"])
-        .allow_methods(vec!["GET", "POST", "OPTIONS"]);
-
-    let routes = ws_route
-        .or(health)
-        .or(stats)
-        .with(cors);
-
-    let port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "8080".to_string())
-        .parse()
-        .unwrap_or(8080);
-
-    let addr: SocketAddr = ([0, 0, 0, 0], port).into();
-    
-    info!("🚀 P2P WebSocket Server starting on {}", addr);
-    info!("📊 Health: http://localhost:{}/health", port);
-    info!("📈 Stats: http://localhost:{}/stats", port);
-
-    warp::serve(routes)
-        .run(addr)
-        .await;
+    if let (Ok(cert), Ok(key)) = (std::env::var("CERT_PATH"), std::env::var("KEY_PATH")) {
+        warp::serve(routes).tls().cert_path(cert).key_path(key).run(addr).await;
+    } else {
+        warp::serve(routes).run(addr).await;
+    }
 
     Ok(())
 }
 
-async fn ws_handler(
-    ws: Ws,
-    state: Arc<AppState>,
-) -> Result<impl Reply, Infallible> {
+// WebSocket handshake
+async fn ws_handler(ws: Ws, state: Arc<AppState>) -> Result<impl Reply, Infallible> {
     Ok(ws.on_upgrade(move |socket| handle_client(socket, state)))
 }
 
-async fn handle_client(
-    socket: tokio_tungstenite::WebSocketStream<warp::ws::WebSocket>,
-    state: Arc<AppState>,
-) {
-    let client_id = uuid::Uuid::new_v4().to_string();
-    let (mut ws_sender, mut ws_receiver) = socket.split();
+// Client lifecycle
+async fn handle_client(socket: warp::ws::WebSocket, state: Arc<AppState>) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let client_id = Uuid::new_v4().to_string();
 
-    info!("🔌 New client connected: {}", client_id);
-
-    // Handle outgoing messages
-    let outgoing = async {
+    // Outgoing loop
+    let tx_clone = tx.clone();
+    tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if ws_sender.send(msg).await.is_err() {
-                break;
+            if ws_tx.send(msg).await.is_err() { break; }
+        }
+    });
+
+    // Incoming loop
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            if let Message::Text(text) = msg {
+                if let Err(e) = handle_message(&state_clone, &client_id, &tx_clone, &text).await {
+                    error!("Error handling message: {}", e);
+                }
             }
         }
-    };
-
-    // Handle incoming messages
-    let incoming = async {
-        while let Some(result) = ws_receiver.next().await {
-            match result {
-                Ok(Message::Text(text)) => {
-                    if let Err(e) = handle_message(&state, &client_id, &text).await {
-                        error!("Message handling error: {}", e);
-                    }
-                }
-                Ok(Message::Binary(data)) => {
-                    if let Err(e) = handle_binary_message(&state, &client_id, &data).await {
-                        error!("Binary message handling error: {}", e);
-                    }
-                }
-                Ok(Message::Close(_)) => break,
-                Err(e) => {
-                    error!("WebSocket error: {}", e);
-                    break;
-                }
-                _ => {}
-            }
-        }
-    };
-
-    // Run both tasks
-    tokio::select! {
-        _ = incoming => {},
-        _ = outgoing => {},
-    }
-
-    // Cleanup
-    state.clients.remove(&client_id);
-    info!("🔌 Client disconnected: {}", client_id);
+        // Cleanup
+        state_clone.clients.remove(&client_id);
+    });
 }
 
+// Route incoming messages
 async fn handle_message(
     state: &Arc<AppState>,
     client_id: &str,
+    tx: &UnboundedSender<Message>,
     text: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let msg: WsMessage = serde_json::from_str(text)?;
-
+    let msg: WsMessageIn = serde_json::from_str(text)?;
     match msg.msg_type.as_str() {
-        "auth" => handle_auth(state, client_id, msg).await?,
-        "sync_request" => handle_sync_request(state, client_id, msg).await?,
-        "create_post" => handle_create_post(state, client_id, msg).await?,
-        "like_post" => handle_like_post(state, client_id, msg).await?,
-        "ping" => handle_ping(state, client_id).await?,
-        _ => warn!("Unknown message type: {}", msg.msg_type),
+        "auth"   => handle_auth(state, client_id, tx, msg).await?,
+        "create" => handle_create(state, client_id, msg).await?,
+        "edit"   => handle_edit(state, client_id, msg).await?,
+        "delete" => handle_delete(state, client_id, msg).await?,
+        "like"   => handle_like(state, client_id, msg).await?,
+        _ => {}
     }
-
-    Ok(())
-}
-
-async fn handle_binary_message(
-    state: &Arc<AppState>,
-    client_id: &str,
-    data: &[u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Decompress LZ4
-    let decompressed = lz4_flex::decompress_size_prepended(data)?;
-    
-    // Deserialize MessagePack
-    let delta: DeltaSync = rmp_serde::from_slice(&decompressed)?;
-    
-    info!("📦 Received compressed delta: {} ops", delta.operations.len());
-    
-    // Apply operations
-    apply_delta_operations(state, &delta.operations).await?;
-    
-    // Broadcast to other clients
-    broadcast_delta(state, client_id, &delta).await?;
-    
     Ok(())
 }
 
 async fn handle_auth(
     state: &Arc<AppState>,
     client_id: &str,
-    msg: WsMessage,
+    tx: &UnboundedSender<Message>,
+    msg: WsMessageIn,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let auth = msg.auth.ok_or("Missing auth data")?;
-    let master_key = msg.master_key.ok_or("Missing master key")?;
+    let auth = msg.auth.ok_or("Missing auth")?;
+    let mk = msg.master_key.ok_or("Missing master key")?;
+    // verify Telegram hash
+    let data_str = format!("auth_date={}&first_name={}&id={}&username={}", auth.auth_date, auth.first_name, auth.id, auth.username.clone().unwrap_or_default());
+    let mut mac = HmacSha256::new_from_slice(format!("WebAppData{}", state.bot_token).as_bytes())?;
+    mac.update(data_str.as_bytes());
+    if hex::encode(mac.finalize().into_bytes()) != auth.hash { return Err("Invalid auth".into()); }
+    // store master key
+    let mk_stored = state.user_keys.entry(auth.id).or_insert(mk.clone()).clone();
+    // persist
+    let tree = state.db.open_tree("user_keys")?;
+    tree.insert(&auth.id.to_le_bytes(), mk_stored.as_bytes())?;
 
-    // Verify Telegram authentication
-    if !verify_telegram_auth(&auth, &state.bot_token) {
-        return Err("Invalid Telegram authentication".into());
-    }
+    // add client
+    state.clients.insert(client_id.to_string(), Client { sender: tx.clone(), user_id: auth.id, master_key: mk_stored.clone() });
+    info!("User {} authenticated", auth.id);
 
-    // Get or create master key for user
-    let stored_key = state.user_keys
-        .entry(auth.id)
-        .or_insert_with(|| master_key.clone())
-        .clone();
-
-    // Verify master key matches
-    if stored_key != master_key {
-        return Err("Master key mismatch".into());
-    }
-
-    // Create client
-    let (tx, _) = tokio::sync::mpsc::unbounded_channel();
-    let client = Client {
-        sender: tx,
-        user_id: auth.id,
-        master_key: master_key.clone(),
-        joined_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-        last_sync: 0,
-    };
-
-    state.clients.insert(client_id.to_string(), client);
-
-    info!("✅ User {} authenticated with master key", auth.id);
-
-    // Send auth success
-    let response = serde_json::json!({
-        "type": "auth_success",
-        "user_id": auth.id,
-        "master_key": stored_key,
-        "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
-    });
-
-    send_to_client(state, client_id, Message::Text(response.to_string())).await;
-
+    let out = WsMessageOut { msg_type: "auth_success".into(), inner: AuthSuccess { user_id: auth.id, master_key: mk_stored, timestamp: now_secs() }};
+    let txt = serde_json::to_string(&out)?;
+    tx.send(Message::Text(txt))?;
     Ok(())
 }
 
-async fn handle_sync_request(
+async fn handle_create(
     state: &Arc<AppState>,
     client_id: &str,
-    msg: WsMessage,
+    msg: WsMessageIn,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let since = msg.timestamp.unwrap_or(0);
-    
-    // Get operations since timestamp
-    let operations = state.operations.read().await;
-    let filtered_ops: Vec<PostOperation> = operations
-        .iter()
-        .filter(|op| op.timestamp > since)
-        .cloned()
-        .collect();
-    drop(operations);
+    let data = msg.data.ok_or("Missing data")?;
+    let client = state.clients.get(client_id).ok_or("Not authed")?;
+    let title = data["title"].as_str().unwrap_or_default().to_string();
+    let content = data["content"].as_str().unwrap_or_default().to_string();
+    let id = Uuid::new_v4().to_string();
+    let ts = now_secs();
 
-    // Get relevant string pool entries
-    let string_pool_entries: Vec<(u32, String)> = state.string_pool
-        .iter()
-        .map(|entry| (*entry.key(), entry.value().clone()))
-        .collect();
+    let post = CompactPost { id: id.clone(), author: client.user_id, title: title.clone(), content: content.clone(), timestamp: ts, likes: 0 };
+    state.posts.insert(id.clone(), post.clone());
 
-    let delta = DeltaSync {
-        operations: filtered_ops,
-        string_pool: string_pool_entries,
-        since_timestamp: since,
-        merkle_root: calculate_merkle_root(state).await,
-    };
+    let sig = { let mut m=HmacSha256::new_from_slice(client.master_key.as_bytes())?; m.update(id.as_bytes()); hex::encode(m.finalize().into_bytes()) };
+    let op = PostOperation { op_type: "create".into(), post: Some(post.clone()), post_id: Some(id.clone()), user_id: client.user_id, timestamp: ts, signature: sig };
+    state.operations.write().await.push(op.clone());
+    let tree = state.db.open_tree("operations")?;
+    tree.insert(&ts.to_le_bytes(), serde_json::to_vec(&op)?)?;
+    let tree2 = state.db.open_tree("posts")?;
+    tree2.insert(id.as_bytes(), serde_json::to_vec(&post)?)?;
 
-    // Compress with MessagePack + LZ4
-    let serialized = rmp_serde::to_vec(&delta)?;
-    let compressed = lz4_flex::compress_prepend_size(&serialized);
-
-    info!("📤 Sending sync: {} ops, compressed {} -> {} bytes", 
-          delta.operations.len(), serialized.len(), compressed.len());
-
-    send_to_client(state, client_id, Message::Binary(compressed)).await;
-
+    broadcast(state, client_id, &op).await;
     Ok(())
 }
 
-async fn handle_create_post(
+async fn handle_edit(
     state: &Arc<AppState>,
     client_id: &str,
-    msg: WsMessage,
+    msg: WsMessageIn,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let data = msg.data.ok_or("Missing post data")?;
-    let client = state.clients.get(client_id).ok_or("Client not authenticated")?;
+    let data = msg.data.ok_or("Missing data")?;
+    let id = data["post_id"].as_str().unwrap_or_default();
+    let new_title = data["title"].as_str().unwrap_or_default().to_string();
+    let new_content = data["content"].as_str().unwrap_or_default().to_string();
+    if let Some(mut post) = state.posts.get_mut(id) {
+        post.title = new_title.clone();
+        post.content = new_content.clone();
+        // persist
+        let tree = state.db.open_tree("posts")?;
+        tree.insert(id.as_bytes(), serde_json::to_vec(&*post)?)?;
 
-    // Parse post data
-    let title: String = data["title"].as_str().ok_or("Missing title")?.to_string();
-    let content: String = data["content"].as_str().ok_or("Missing content")?.to_string();
-    let tags: u16 = data["tags"].as_u64().unwrap_or(0) as u16;
-
-    // Add strings to pool
-    let title_hash = add_to_string_pool(&state.string_pool, title);
-    let content_hash = add_to_string_pool(&state.string_pool, content);
-
-    // Create post
-    let post_id = generate_post_id();
-    let post = CompactPost {
-        id: post_id,
-        author: client.user_id,
-        title_hash,
-        content_hash,
-        timestamp: (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - 1_700_000_000) as u32,
-        likes: 0,
-        tags,
-        meta: 0,
-    };
-
-    // Store post
-    state.posts.insert(post_id, post.clone());
-
-    // Create operation
-    let operation = PostOperation {
-        op_type: "create".to_string(),
-        post: Some(post),
-        post_id: Some(post_id),
-        user_id: client.user_id,
-        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-        signature: generate_signature(&client.master_key, post_id),
-    };
-
-    // Store operation
-    state.operations.write().await.push(operation.clone());
-
-    info!("📝 Post {} created by user {}", post_id, client.user_id);
-
-    // Broadcast to all clients
-    broadcast_operation(state, client_id, &operation).await;
-
-    Ok(())
-}
-
-async fn handle_like_post(
-    state: &Arc<AppState>,
-    client_id: &str,
-    msg: WsMessage,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let data = msg.data.ok_or("Missing like data")?;
-    let client = state.clients.get(client_id).ok_or("Client not authenticated")?;
-    let post_id = data["post_id"].as_u64().ok_or("Missing post_id")? as u32;
-    let liked = data["liked"].as_bool().unwrap_or(true);
-
-    // Update post likes
-    if let Some(mut post) = state.posts.get_mut(&post_id) {
-        if liked {
-            post.likes = post.likes.saturating_add(1);
-        } else {
-            post.likes = post.likes.saturating_sub(1);
-        }
+        // op
+        let client = state.clients.get(client_id).unwrap();
+        let ts = now_secs();
+        let sig = { let mut m=HmacSha256::new_from_slice(client.master_key.as_bytes())?; m.update(id.as_bytes()); hex::encode(m.finalize().into_bytes()) };
+        let op = PostOperation { op_type:"edit".into(), post: Some(post.clone()), post_id: Some(id.into()), user_id: client.user_id, timestamp: ts, signature: sig };
+        state.operations.write().await.push(op.clone());
+        state.db.open_tree("operations")?.insert(ts.to_le_bytes(), serde_json::to_vec(&op)?)?;
+        broadcast(state, client_id, &op).await;
     }
-
-    // Create operation
-    let operation = PostOperation {
-        op_type: "like".to_string(),
-        post: None,
-        post_id: Some(post_id),
-        user_id: client.user_id,
-        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-        signature: generate_signature(&client.master_key, post_id),
-    };
-
-    // Store operation
-    state.operations.write().await.push(operation.clone());
-
-    // Broadcast to all clients
-    broadcast_operation(state, client_id, &operation).await;
-
     Ok(())
 }
 
-async fn handle_ping(
+async fn handle_delete(
     state: &Arc<AppState>,
     client_id: &str,
+    msg: WsMessageIn,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let response = serde_json::json!({
-        "type": "pong",
-        "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
-    });
-
-    send_to_client(state, client_id, Message::Text(response.to_string())).await;
+    let data = msg.data.ok_or("Missing data")?;
+    let id = data["post_id"].as_str().unwrap_or_default();
+    state.posts.remove(id);
+    state.db.open_tree("posts")?.remove(id.as_bytes())?;
+    let client = state.clients.get(client_id).unwrap();
+    let ts = now_secs();
+    let sig = { let mut m=HmacSha256::new_from_slice(client.master_key.as_bytes())?; m.update(id.as_bytes()); hex::encode(m.finalize().into_bytes()) };
+    let op = PostOperation { op_type:"delete".into(), post: None, post_id: Some(id.into()), user_id: client.user_id, timestamp: ts, signature: sig };
+    state.operations.write().await.push(op.clone());
+    state.db.open_tree("operations")?.insert(ts.to_le_bytes(), serde_json::to_vec(&op)?)?;
+    broadcast(state, client_id, &op).await;
     Ok(())
 }
 
-// === HELPER FUNCTIONS ===
-
-fn verify_telegram_auth(auth: &TelegramAuth, bot_token: &str) -> bool {
-    // Create data string for HMAC verification
-    let data_string = format!(
-        "auth_date={}&first_name={}&id={}&username={}",
-        auth.auth_date,
-        auth.first_name,
-        auth.id,
-        auth.username.as_deref().unwrap_or("")
-    );
-
-    // Calculate HMAC
-    let secret_key = format!("WebAppData{}", bot_token);
-    let mut mac = HmacSha256::new(secret_key.as_bytes());
-    mac.update(data_string.as_bytes());
-    let expected = hex::encode(mac.finalize().into_bytes());
-
-    // Verify hash
-    expected == auth.hash
-}
-
-async fn init_string_pool(pool: &Arc<DashMap<u32, String>>) {
-    let common_strings = vec![
-        "спорт", "технологии", "путешествия", "еда", "музыка",
-        "искусство", "новости", "игры", "крипто", "учеба",
-        "работа", "здоровье", "фото", "видео", "мемы", "другое"
-    ];
-
-    for s in common_strings {
-        let hash = calculate_string_hash(s);
-        pool.insert(hash, s.to_string());
-    }
-
-    info!("🎯 String pool initialized with {} entries", pool.len());
-}
-
-fn add_to_string_pool(pool: &Arc<DashMap<u32, String>>, text: String) -> u32 {
-    let hash = calculate_string_hash(&text);
-    pool.entry(hash).or_insert(text);
-    hash
-}
-
-fn calculate_string_hash(s: &str) -> u32 {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    let result = hasher.finalize();
-    u32::from_le_bytes([result[0], result[1], result[2], result[3]])
-}
-
-fn generate_post_id() -> u32 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u32
-}
-
-fn generate_signature(master_key: &str, post_id: u32) -> String {
-    let mut mac = HmacSha256::new(master_key.as_bytes());
-    mac.update(&post_id.to_le_bytes());
-    hex::encode(mac.finalize().into_bytes())
-}
-
-async fn apply_delta_operations(
+async fn handle_like(
     state: &Arc<AppState>,
-    operations: &[PostOperation],
+    client_id: &str,
+    msg: WsMessageIn,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for op in operations {
-        match op.op_type.as_str() {
-            "create" => {
-                if let Some(post) = &op.post {
-                    state.posts.insert(post.id, post.clone());
-                }
+    let data = msg.data.ok_or("Missing data")?;
+    let id = data["post_id"].as_str().unwrap_or_default();
+    if let Some(mut post) = state.posts.get_mut(id) {
+        post.likes = post.likes.saturating_add(1);
+        state.db.open_tree("posts")?.insert(id.as_bytes(), serde_json::to_vec(&*post)?)?;
+        let client = state.clients.get(client_id).unwrap();
+        let ts = now_secs();
+        let sig = { let mut m=HmacSha256::new_from_slice(client.master_key.as_bytes())?; m.update(id.as_bytes()); hex::encode(m.finalize().into_bytes()) };
+        let op = PostOperation { op_type:"like".into(), post: None, post_id: Some(id.into()), user_id: client.user_id, timestamp: ts, signature: sig };
+        state.operations.write().await.push(op.clone());
+        state.db.open_tree("operations")?.insert(ts.to_le_bytes(), serde_json::to_vec(&op)?)?;
+        broadcast(state, client_id, &op).await;
+    }
+    Ok(())
+}
+
+// Broadcast op to all other clients
+async fn broadcast(state: &Arc<AppState>, exclude: &str, op: &PostOperation) {
+    let out = WsMessageOut { msg_type: "operation".into(), inner: op };
+    if let Ok(txt) = serde_json::to_string(&out) {
+        for kv in state.clients.iter() {
+            if kv.key() != exclude {
+                let _ = kv.value().sender.send(Message::Text(txt.clone()));
             }
-            "like" => {
-                if let Some(post_id) = op.post_id {
-                    if let Some(mut post) = state.posts.get_mut(&post_id) {
-                        post.likes = post.likes.saturating_add(1);
-                    }
-                }
-            }
-            _ => {}
         }
     }
-
-    // Store operations
-    let mut ops = state.operations.write().await;
-    ops.extend(operations.iter().cloned());
-    
-    // Keep only last 10000 operations
-    if ops.len() > 10000 {
-        ops.drain(0..ops.len() - 10000);
-    }
-
-    Ok(())
 }
 
-async fn broadcast_operation(state: &Arc<AppState>, exclude_client: &str, operation: &PostOperation) {
-    let msg = serde_json::json!({
-        "type": "operation",
-        "operation": operation
-    });
+fn now_secs() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() }
 
-    broadcast_message(state, exclude_client, Message::Text(msg.to_string())).await;
-}
-
-async fn broadcast_delta(state: &Arc<AppState>, exclude_client: &str, delta: &DeltaSync) {
-    // Compress delta
-    if let Ok(serialized) = rmp_serde::to_vec(delta) {
-        let compressed = lz4_flex::compress_prepend_size(&serialized);
-        broadcast_message(state, exclude_client, Message::Binary(compressed)).await;
-    }
-}
-
-async fn broadcast_message(state: &Arc<AppState>, exclude_client: &str, message: Message) {
-    let mut failed_clients = Vec::new();
-
-    for entry in state.clients.iter() {
-        let client_id = entry.key();
-        let client = entry.value();
-
-        if client_id == exclude_client {
-            continue;
-        }
-
-        if client.sender.send(message.clone()).is_err() {
-            failed_clients.push(client_id.clone());
-        }
-    }
-
-    // Remove failed clients
-    for client_id in failed_clients {
-        state.clients.remove(&client_id);
-    }
-}
-
-async fn send_to_client(state: &Arc<AppState>, client_id: &str, message: Message) {
-    if let Some(client) = state.clients.get(client_id) {
-        let _ = client.sender.send(message);
-    }
-}
-
-async fn calculate_merkle_root(state: &Arc<AppState>) -> String {
-    let operations = state.operations.read().await;
-    let mut hasher = sha2::Sha256::new();
-    
-    for op in operations.iter() {
-        hasher.update(&op.timestamp.to_le_bytes());
-        hasher.update(&op.user_id.to_le_bytes());
-        if let Some(post_id) = op.post_id {
-            hasher.update(&post_id.to_le_bytes());
-        }
-    }
-    
-    hex::encode(hasher.finalize())
-}
-
-fn calculate_compression_ratio(state: &Arc<AppState>) -> f64 {
-    let post_count = state.posts.len();
-    if post_count == 0 {
-        return 0.0;
-    }
-
-    let compressed_size = post_count * std::mem::size_of::<CompactPost>();
-    let uncompressed_size = post_count * 2500; // Estimated JSON size
-    
-    1.0 - (compressed_size as f64 / uncompressed_size as f64)
-}
-
-fn get_memory_usage() -> u64 {
-    // Simple memory estimation
-    std::process::id() as u64 // Placeholder
-}
-
-fn with_state(
-    state: Arc<AppState>,
-) -> BoxedFilter<(Arc<AppState>,)> {
-    warp::any().map(move || state.clone()).boxed()
+fn current_memory_mb() -> u64 {
+    let mut sys = System::new_all(); sys.refresh_process(sysinfo::get_current_pid().unwrap());
+    sys.process(sysinfo::get_current_pid().unwrap()).map(|p| p.memory() / 1024).unwrap_or(0)
 }
