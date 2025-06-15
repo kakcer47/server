@@ -69,7 +69,7 @@ async fn main() {
         .and(warp::ws())
         .and(warp::header::optional::<String>("user-agent"))
         .and(with_clients(clients.clone()))
-        .and_then(|ws: Ws, user_agent: Option<String>, clients| async move {
+        .and_then(|ws: Ws, user_agent: Option<String>, clients: Clients| async move {
             // Проверяем количество клиентов
             if clients.len() >= MAX_CLIENTS {
                 warn!("🚫 Max clients limit reached: {}", MAX_CLIENTS);
