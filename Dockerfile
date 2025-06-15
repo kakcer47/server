@@ -2,7 +2,7 @@ FROM rust:1.78 as builder
 
 WORKDIR /usr/src/app
 
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 
